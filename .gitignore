@@ -66,3 +66,9 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# DLLs (keep only source files)
+!.deps/**/*.dll
+.claude/*
+.claude/
+.DS_Store
