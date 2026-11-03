@@ -42,13 +42,6 @@ namespace {
     std::mutex g_mutex;
     bool g_loadedOnce = false;
 
-    // order 归一化成小写再比对，避免大小写写错导致回退顺序不符合预期
-    static std::string NormalizeRemoteOrder(std::string s) {
-        for (auto& c : s)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        return s;
-    }
-
     const char* ToString(LogLevel level) {
         switch (level) {
         case LogLevel::Trace: return "trace";
