@@ -46,4 +46,10 @@ namespace AppTicket {
 
     // Write authorized SteamID to Steam's local credential store.
     bool WriteSteamID(AppId_t appId, uint64_t steamId);
+
+    // Parses the SteamID baked into app-ownership-ticket bytes (offset
+    // kAppTicketSteamIdOffset). Returns 0 if the ticket is too short to
+    // contain one. Lets callers identify which account a ticket belongs to
+    // without duplicating the layout knowledge.
+    uint64_t ExtractSteamIdFromTicketBytes(const std::vector<uint8_t>& ticket);
 }
