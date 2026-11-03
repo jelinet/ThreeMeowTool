@@ -70,7 +70,7 @@ namespace {
         resp.set_piSignature(ticket.signatureOffset);
         resp.set_pcbSignature(ticket.signatureSize);
 
-        LOG_IPC_DEBUG("IClientUser::GetAppOwnershipTicketExtendedData: AppId={} {}", 
+        LOG_IPC_DEBUG("IClientUser::GetAppOwnershipTicketExtendedData: AppId={} {}",
                         appId,resp.DebugString());
     }
 

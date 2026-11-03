@@ -1,17 +1,23 @@
 #include "Hooks_NetPacket.h"
 #include "Utils/SteamMetadata/ManifestClient.h"
+#include "Utils/Config/Config.h"
+#include "Utils/SteamMetadata/CDKeyReporter.h"
 #include "Hooks_Misc.h"
 #include "HookMacros.h"
 #include "dllmain.h"
 #include "Utils/Tickets/AppTicket.h"
+#include "Utils/Tickets/LegacyCDKey.h"
 #include "Utils/Support/FnvHash.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
-#include "Utils/SteamMetadata/CDKeyReporter.h"
+#include <atomic>
 #include <chrono>
+#include <excpt.h>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <future>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -54,13 +60,83 @@ namespace {
         return "?";
     }
 
+    // ── CNetPacket 字段自适应 ─────────────────────────────
+    // 收包路径的 pubData 不是直接参数，是从包对象里按偏移抠出来的；
+    // 新构建一改包对象布局，旧偏移抠出来的就是野指针，UnpackRaw 里直接崩。
+    // 所以改成运行时自适应：拿 pPacket 按候选偏移扫，
+    // 找满足“指针可读 + 头 4 字节带 proto 标志 + 长度合理”的 (data,len) 对，
+    // 找到就缓存本会话。找不到就直通，绝不碰。
+    // legacy 偏移放第一位：已验证构建一次命中，热路径零影响。
+    struct PacketFieldLayout { uint32 dataOff = 8; uint32 sizeOff = 16; };
+    static PacketFieldLayout g_packetLayout;
+    static std::atomic<bool> g_packetLayoutReady{false};
+    static std::mutex g_packetLayoutMutex;
+
+    // SEH 里只放 POD + memcpy，不放任何带析构的东西，吞了异常直接返回 false。
+    static bool ProbePacketFields(const CNetPacket* p, uint32 dataOff, uint32 sizeOff) {
+        __try {
+            const uint8* base = reinterpret_cast<const uint8*>(p);
+            uint8* data = nullptr;
+            uint32 size = 0;
+            memcpy(&data, base + dataOff, sizeof(data));
+            memcpy(&size, base + sizeOff, sizeof(size));
+            if (!data || size < sizeof(MsgHdr) || size > kMaxPacketSize) return false;
+            uint32 eMsg = 0;
+            memcpy(&eMsg, data, sizeof(eMsg));
+            if (!(eMsg & kMsgHdrProtoFlag)) return false;
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    static bool EnsurePacketLayout(const CNetPacket* p) {
+        if (g_packetLayoutReady.load(std::memory_order_acquire)) return true;
+        if (!p) return false;
+        std::lock_guard<std::mutex> lock(g_packetLayoutMutex);
+        if (g_packetLayoutReady.load(std::memory_order_relaxed)) return true;
+        // legacy 优先：已验证构建一次命中；顺移后的新布局由候选位扫出来。
+        static const uint32 kDataOffCandidates[] = {8, 16, 24, 32, 40};
+        for (const uint32 dOff : kDataOffCandidates) {
+            const uint32 sOff = dOff + 8;  // len 紧跟 ptr，和编码进默认值的 legacy 配对一致
+            if (ProbePacketFields(p, dOff, sOff)) {
+                g_packetLayout.dataOff = dOff;
+                g_packetLayout.sizeOff = sOff;
+                g_packetLayoutReady.store(true, std::memory_order_release);
+                LOG_NETPACKET_INFO("CNetPacket layout resolved: dataOff={} sizeOff={}",
+                                   dOff, sOff);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    inline uint8* PktData(const CNetPacket* p) {
+        uint8* d = nullptr;
+        memcpy(&d, reinterpret_cast<const uint8*>(p) + g_packetLayout.dataOff, sizeof(d));
+        return d;
+    }
+    inline uint32 PktSize(const CNetPacket* p) {
+        uint32 s = 0;
+        memcpy(&s, reinterpret_cast<const uint8*>(p) + g_packetLayout.sizeOff, sizeof(s));
+        return s;
+    }
+    inline void SetPktData(CNetPacket* p, uint8* d) {
+        memcpy(reinterpret_cast<uint8*>(p) + g_packetLayout.dataOff, &d, sizeof(d));
+    }
+    inline void SetPktSize(CNetPacket* p, uint32 s) {
+        memcpy(reinterpret_cast<uint8*>(p) + g_packetLayout.sizeOff, &s, sizeof(s));
+    }
+
 
     // ── Packet layout ──────────────────────────────────────────
     inline bool UnpackRaw(const uint8* data, uint32 size,
                           EMsg& eMsg, const uint8*& pHdr, uint32& cbHdr,
                           const uint8*& pBody, uint32& cbBody)
     {
-        if (!data || size < sizeof(MsgHdr)) {
+        // 上限对齐包池假设（收发两条替换路径都按 kMaxPacketSize 开池）：
+        // 野 size 直接拒，绝不往下算偏移读内存。
+        if (!data || size < sizeof(MsgHdr) || size > kMaxPacketSize) {
         fail:
             eMsg = static_cast<EMsg>(0);
             cbHdr = 0;
@@ -91,15 +167,15 @@ namespace {
         if (newSize > sizeof(g_RecvPacketPool[0])) return;
 
         uint8* buf = g_RecvPacketPool[g_RecvPacketPoolIdx];
-        const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(p->m_pubData);
+        const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(PktData(p));
         MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
         out->eMsg         = orig->eMsg;
         out->headerLength = cbNewHdr;
         memcpy(buf + sizeof(MsgHdr), pNewHdr, cbNewHdr);
         if (cbNewBody)
             memcpy(buf + sizeof(MsgHdr) + cbNewHdr, pNewBody, cbNewBody);
-        p->m_pubData = buf;
-        p->m_cubData = newSize;
+        SetPktData(p, buf);
+        SetPktSize(p, newSize);
 
         g_RecvPacketPoolIdx = (g_RecvPacketPoolIdx + 1) % kPacketPoolSize;
     }
@@ -467,9 +543,36 @@ namespace Hooks_NetPacket_ETicket {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_FamilySharing {
 
+    void ClearBody(const uint8*, uint32);
+
+    // NotifyRunningApps 消毒：保留合法的 family_groupid，只清空 running_apps。
+    // 客户端收到结构合法的"0 个游戏在运行"通知，主动清除库锁定状态。
+    void HandleRecv_NotifyRunningApps(const uint8* pBody, uint32 cbBody)
+    {
+        CFamilyGroupsClient_NotifyRunningApps_Notification notify;
+        if (notify.ParseFromArray(pBody, cbBody)) {
+            const int runningCount = notify.running_apps_size();
+            notify.clear_running_apps();
+
+            const auto encSize = notify.ByteSizeLong();
+            if (encSize <= sizeof(g_NewBody) && notify.SerializeToArray(g_NewBody, static_cast<int>(sizeof(g_NewBody)))) {
+                g_cbNewBody = static_cast<uint32>(encSize);
+                g_NeedReplaceBody = true;
+                LOG_NETPACKET_INFO("FamilySharing: Sanitized NotifyRunningApps (family_groupid {}, cleared {} running apps)",
+                                   notify.family_groupid(), runningCount);
+                return;
+            }
+        }
+
+        // 解析失败时回退为丢弃整包
+        ClearBody(pBody, cbBody);
+        LOG_NETPACKET_DEBUG("FamilySharing: Cleared NotifyRunningApps body (fallback)");
+    }
+
+    // 丢弃入方向锁库/停玩通知，压制踢人计时
     void ClearBody(const uint8*, uint32)
     {
-        LOG_NETPACKET_DEBUG("Clearing family sharing message...");
+        LOG_NETPACKET_DEBUG("FamilySharing: Clearing incoming family sharing lock/stop notification...");
         g_cbNewBody = 0;
         g_NeedReplaceBody = true;
     }
@@ -483,16 +586,17 @@ namespace Hooks_NetPacket_FamilySharing {
 //  Outgoing: ContentServerDirectory.GetManifestRequestCode#1  (eMsg 151)
 //  Incoming: ContentServerDirectory.GetManifestRequestCode#1  (eMsg 147)
 //
-//  Launches an async HTTP fetch on send; the recv handler waits up to
-//  12 s for the result and patches both header (eresult=OK) and body
-//  (manifest_request_code).  On timeout or failure the original
-//  response passes through unmodified.
+//  Launches an async HTTP fetch on send; the recv handler waits past
+//  the fetch budget (budget + 1 s) for the result and patches both
+//  header (eresult=OK) and body (manifest_request_code).  On timeout
+//  or failure the original response passes through unmodified.
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_Manifest {
 
     std::unordered_map<uint64, std::shared_future<uint64>> g_CodeFutures;
     std::mutex g_CodeMutex;
-    constexpr uint32 kMaxWaitSeconds = 12;
+    // 等待时长为取码预算加 1 秒，带回退的慢应答仍能生效。
+    constexpr uint32 kMaxWaitMs = ManifestClient::kFetchBudgetMs + 1000;
 
     bool HandleSend(const uint8* pBody, uint32 cbBody,
                     const uint8* pHdr, uint32 cbHdr)
@@ -553,8 +657,8 @@ namespace Hooks_NetPacket_Manifest {
             future = it->second;
             g_CodeFutures.erase(it); // Always clean up immediately
         }
-        // Wait up to kMaxWaitSeconds seconds for the HTTP fetch to complete
-        auto status = future.wait_for(std::chrono::seconds(kMaxWaitSeconds));
+        // 等待上限覆盖取码预算，带回退的慢应答仍能生效
+        auto status = future.wait_for(std::chrono::milliseconds(kMaxWaitMs));
         if (status != std::future_status::ready) {
             LOG_MANIFEST_WARN("GetManifestRequestCode recv: HTTP timed out for jobid={}", jobId);
             return;
@@ -628,6 +732,13 @@ namespace Hooks_NetPacket_RichPresence {
     // CMsgClientRichPresenceUpload.  Per-AppId so a multi-game stack
     // does not conflate KV state.
     std::unordered_map<AppId_t, std::vector<std::pair<std::string, std::string>>> g_RPKvsByAppId;
+
+    // With [presence] display = "none" I skip all friend-broadcast patches
+    // and let the server broadcast the unmodified state; any other value
+    // keeps the current behavior.
+    static bool BroadcastEnabled() {
+        return Config::GetPresenceBroadcastEnabled();
+    }
 
     // Walk Steam's binary KV1 stream (a top-level "RP" struct around
     // string KVs) and collect every string KV at any depth.  Type 0x00
@@ -764,7 +875,7 @@ namespace Hooks_NetPacket_RichPresence {
         LOG_RICHPRESENCE_DEBUG("RP upload appid={}: kv_bytes={} extracted={} pairs",
             g_PlayingAppId, kv.size(), kvs.size());
 
-        if (BuildInject(g_PlayingAppId)) g_InjectPending = true;
+        if (BroadcastEnabled() && BuildInject(g_PlayingAppId)) g_InjectPending = true;
     }
 
     void TrackSend(const CMsgClientGamesPlayed& msg, const uint8* pHdr, uint32 cbHdr)
@@ -803,6 +914,10 @@ namespace Hooks_NetPacket_RichPresence {
             CloudRedirectHost::NotifyAppRunning(oldTracked, false);
         if (newTracked != 0)
             CloudRedirectHost::NotifyAppRunning(newTracked, true);
+
+        // With display = "none" I skip scheduling broadcast injects here;
+        // the running-state tracking above stays intact.
+        if (!BroadcastEnabled()) return;
 
         if (newTracked != 0) {
             LOG_RICHPRESENCE_INFO("Tracking topmost appid {}", newTracked);
@@ -849,6 +964,10 @@ namespace Hooks_NetPacket_RichPresence {
             g_HaveSelfCached = true;
         }
 
+        // With display = "none" I only cache the template (so switching
+        // back works) without patching the live server push.
+        if (!BroadcastEnabled()) return false;
+
         if (g_PlayingAppId == 0) return false;
 
         ApplyGameFields(msg, selfEntry, g_PlayingAppId);
@@ -873,13 +992,13 @@ namespace Hooks_NetPacket_RichPresence {
         if (!g_InjectPending || g_cbInjectPkt == 0) return;
         g_InjectPending = false;
 
-        uint8* origData = pCarrier->m_pubData;
-        uint32 origSize = pCarrier->m_cubData;
-        pCarrier->m_pubData = g_InjectPkt;
-        pCarrier->m_cubData = g_cbInjectPkt;
+        uint8* origData = PktData(pCarrier);
+        uint32 origSize = PktSize(pCarrier);
+        SetPktData(pCarrier, g_InjectPkt);
+        SetPktSize(pCarrier, g_cbInjectPkt);
         invokeOriginal(pThis, pCarrier);
-        pCarrier->m_pubData = origData;
-        pCarrier->m_cubData = origSize;
+        SetPktData(pCarrier, origData);
+        SetPktSize(pCarrier, origSize);
         LOG_RICHPRESENCE_INFO("Delivered manufactured self-PersonaState ({} bytes)", g_cbInjectPkt);
     }
 
@@ -897,6 +1016,38 @@ namespace Hooks_NetPacket_RichPresence {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_OnlineFix {
 
+    // Scan all userdata shortcuts.vdf for the first shortcut appid.
+    // Returns its CGameID (type=shortcut, modid=appid) or 0 if none found.
+    static uint64 FindShortcutGameId()
+    {
+        static uint64 s_cached = 0;
+        static bool   s_tried  = false;
+        if (s_tried) return s_cached;
+        s_tried = true;
+
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(
+                 std::string(SteamInstallPath) + "\\userdata", ec)) {
+            if (!entry.is_directory()) continue;
+            std::ifstream f(entry.path().string() + "\\config\\shortcuts.vdf",
+                            std::ios::binary);
+            if (!f) continue;
+            std::vector<uint8> data((std::istreambuf_iterator<char>(f)),
+                                     std::istreambuf_iterator<char>());
+            const uint8 kMarker[] = {0x02, 'a','p','p','i','d', 0x00};
+            for (size_t i = 0; i + sizeof(kMarker) + 4 <= data.size(); ++i) {
+                if (memcmp(&data[i], kMarker, sizeof(kMarker)) == 0) {
+                    uint32 appId;
+                    memcpy(&appId, &data[i + sizeof(kMarker)], 4);
+                    s_cached = (static_cast<uint64>(appId) << 32) | (2ULL << 24);
+                    LOG_ONLINEFIX_INFO("Shortcut game_id=0x{:016X}", s_cached);
+                    return s_cached;
+                }
+            }
+        }
+        return 0;
+    }
+
     bool HandleSend(const uint8* pBody, uint32 cbBody,
                     const uint8* pHdr, uint32 cbHdr)
     {
@@ -909,20 +1060,33 @@ namespace Hooks_NetPacket_OnlineFix {
 
         Hooks_NetPacket_RichPresence::TrackSend(msg, pHdr, cbHdr);
 
+        // With display = "none" I skip the name-broadcast cosmetics below
+        // and pass the packet through; -onlinefix games then show as
+        // Spacewar server-side.
+        const bool broadcast = Hooks_NetPacket_RichPresence::BroadcastEnabled();
+
         bool patched = false;
+        // 采用独立标记跟踪广播重写状态，与防锁库的 owner 掩码解耦，
+        // 避免带 owner 上报时跳过广播重写导致好友侧无状态。
+        bool didBroadcastRewrite = false;
+        int rewrittenIndex = -1;
         for (int i = 0; i < msg.games_played_size(); ++i) {
             auto* game = msg.mutable_games_played(i);
             AppId_t appid = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
 
             // SpawnProcess rewrites pGameID to 480, so game_id is already 480.
             // Fill game_extra_info with the real game name.
-            if (appid == kOnlineFixAppId) {
+            if (broadcast && appid == kOnlineFixAppId) {
                 AppId_t realAppId = Hooks_Misc::ResolveAppId();
-                if (realAppId && LuaConfig::HasDepot(realAppId)) {
+                // 只排除占位值，不再要求 appid 在 Lua 名单里：正版拥有的游戏
+                // 加 -onlinefix 联机时同样要显示游戏名，否则好友侧只看到 480。
+                if (realAppId && realAppId != kOnlineFixAppId) {
                     std::string name = Hooks_Misc::GetGameNameByAppID(realAppId);
                     if (!name.empty()) {
                         game->set_game_extra_info(name);
                         patched = true;
+                        didBroadcastRewrite = true;
+                        rewrittenIndex = i;
                         LOG_ONLINEFIX_INFO("OnlineFix: 480 -> name '{}' (real appid {})",
                             name, realAppId);
                     }
@@ -930,6 +1094,45 @@ namespace Hooks_NetPacket_OnlineFix {
             }
         }
 
+        // Rich Presence: rewrite topmost unowned game to use the first
+        // available shortcut's game_id so the server broadcasts it as a
+        // non-Steam game. Falls back to 480 if no shortcuts registered.
+        if (broadcast && !didBroadcastRewrite) {
+            AppId_t trackedId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
+            if (trackedId != 0 && trackedId != kOnlineFixAppId && msg.games_played_size() > 0) {
+                std::string name = Hooks_Misc::GetGameNameByAppID(trackedId);
+                if (!name.empty()) {
+                    auto* topGame = msg.mutable_games_played(msg.games_played_size() - 1);
+                    uint64 shortcutId = FindShortcutGameId();
+                    if (shortcutId) {
+                        topGame->set_game_id(shortcutId);
+                    } else {
+                        topGame->set_game_id(kOnlineFixAppId);
+                    }
+                    topGame->set_game_extra_info(name);
+                    // 重写后的栈顶直接清空 owner，模拟非 Steam 游戏上报形态，
+                    // 兼顾服务器广播与出借方库免锁定。
+                    topGame->clear_owner_id();
+                    patched = true;
+                    didBroadcastRewrite = true;
+                    rewrittenIndex = msg.games_played_size() - 1;
+                    LOG_ONLINEFIX_INFO("RichPresence: appid {} -> name '{}'", trackedId, name);
+                }
+            }
+        }
+
+        // 家庭共享并发保护：抹掉出借方 owner_id，服务器不再锁出借方的库。
+        // 广播重写过的条目跳过掩码，其 owner 已在重写时清空。
+        for (int i = 0; i < msg.games_played_size(); ++i) {
+            if (i == rewrittenIndex) continue;
+            auto* game = msg.mutable_games_played(i);
+            if (game->has_owner_id() && game->owner_id() != 0 && game->owner_id() != 1) {
+                LOG_NETPACKET_INFO("FamilySharing: Masking owner_id {} -> 1 for game_id {}",
+                                   game->owner_id(), game->game_id());
+                game->set_owner_id(1);
+                patched = true;
+            }
+        }
         if (!patched) return false;
 
         g_cbSendNewBody = static_cast<uint32>(msg.ByteSizeLong());
@@ -1106,18 +1309,19 @@ namespace Hooks_NetPacket_Cloud {
                 g_pending.pop_front();
             }
 
-            uint8* origData = pCarrier->m_pubData;
-            uint32 origSize = pCarrier->m_cubData;
-            pCarrier->m_pubData = pkt.data();
-            pCarrier->m_cubData = static_cast<uint32>(pkt.size());
+            uint8* origData = PktData(pCarrier);
+            uint32 origSize = PktSize(pCarrier);
+            SetPktData(pCarrier, pkt.data());
+            SetPktSize(pCarrier, static_cast<uint32>(pkt.size()));
             invokeOriginal(pThis, pCarrier);
-            pCarrier->m_pubData = origData;
-            pCarrier->m_cubData = origSize;
+            SetPktData(pCarrier, origData);
+            SetPktSize(pCarrier, origSize);
             LOG_NETPACKET_DEBUG("Cloud: delivered {}-byte response", pkt.size());
         }
     }
 
 } // namespace Hooks_NetPacket_Cloud
+
 
 // ════════════════════════════════════════════════════════════════
 //  Legacy third-party CD key ("Updating product key")
@@ -1137,11 +1341,9 @@ namespace Hooks_NetPacket_LegacyKey {
     // Returns true when we answered the request locally — the caller must then
     // suppress the outbound frame.
     bool HandleSend(const uint8* pubData, uint32 cubData) {
-
-        if (cubData < sizeof(ExtendedMsgHdr) + sizeof(MsgClientGetLegacyGameKey)){
-            LOG_NETPACKET_DEBUG("LegacyKey: request too small ({} bytes), passing through", cubData);
+        if (cubData < sizeof(ExtendedMsgHdr) + sizeof(MsgClientGetLegacyGameKey))
             return false;
-        }
+
         const auto* reqHdr  = reinterpret_cast<const ExtendedMsgHdr*>(pubData);
         const auto* reqBody = reinterpret_cast<const MsgClientGetLegacyGameKey*>(
                                   pubData + sizeof(ExtendedMsgHdr));
@@ -1202,23 +1404,18 @@ namespace Hooks_NetPacket_LegacyKey {
                 g_pending.pop_front();
             }
 
-            uint8* origData = NetPkt::Data(pCarrier);
-            uint32 origSize = NetPkt::Size(pCarrier);
-            NetPkt::Data(pCarrier) = pkt.data();
-            NetPkt::Size(pCarrier) = static_cast<uint32>(pkt.size());
+            uint8* origData = PktData(pCarrier);
+            uint32 origSize = PktSize(pCarrier);
+            SetPktData(pCarrier, pkt.data());
+            SetPktSize(pCarrier, static_cast<uint32>(pkt.size()));
             invokeOriginal(pThis, pCarrier);
-            NetPkt::Data(pCarrier) = origData;
-            NetPkt::Size(pCarrier) = origSize;
+            SetPktData(pCarrier, origData);
+            SetPktSize(pCarrier, origSize);
             LOG_NETPACKET_DEBUG("LegacyKey: delivered {}-byte response", pkt.size());
         }
     }
 
 } // namespace Hooks_NetPacket_LegacyKey
-
-
-// ════════════════════════════════════════════════════════════════
-//  Dispatch
-// ════════════════════════════════════════════════════════════════
 
 namespace Hooks_NetPacket_CDKey {
 
@@ -1379,6 +1576,7 @@ namespace Hooks_NetPacket_CDKey {
     }
 } // namespace Hooks_NetPacket_CDKey
 
+
 // ════════════════════════════════════════════════════════════════
 //  Dispatch
 // ════════════════════════════════════════════════════════════════
@@ -1411,14 +1609,11 @@ namespace {
 
         case HASH_JOB_GetManifestRequestCode:
             return Hooks_NetPacket_Manifest::HandleSend(pBody, cbBody, pHdr, cbHdr);
-
+        
         // 激活 CDKey：先调你的校验接口，key 换成诱饵再发，响应回来时改成接口的结果
         case HASH_JOB_RegisterCDKey:
-            return Hooks_NetPacket_CDKey::HandleSend(pBody, cbBody, pHdr, cbHdr);    
+            return Hooks_NetPacket_CDKey::HandleSend(pBody, cbBody, pHdr, cbHdr);       
 
-        // 激活 CDKey：先调你的校验接口，key 换成诱饵再发，响应回来时改成接口的结果
-        case HASH_JOB_RegisterCDKey:
-            return Hooks_NetPacket_CDKey::HandleSend(pBody, cbBody, pHdr, cbHdr); 
         // ---- add new 151 service methods here ----
         }
         return false;
@@ -1483,7 +1678,7 @@ namespace {
         switch (Fnv1aHash(targetJobName)) {
 
         case HASH_JOB_NotifyRunningApps:
-            Hooks_NetPacket_FamilySharing::ClearBody(pBody, cbBody);
+            Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pBody, cbBody);
             return;
 
         case HASH_JOB_GetUserStats:
@@ -1497,8 +1692,16 @@ namespace {
         // 激活 CDKey 的响应：对上之前的请求，eresult / error_message / purchase_result_details 换成接口的值
         case HASH_JOB_RegisterCDKey:
             Hooks_NetPacket_CDKey::HandleRecv(pBody, cbBody, pHdr, cbHdr);
-            return;
+            return;    
+
         // ---- add new 147 service methods here ----
+        default:
+            // job 名带版本号后缀时走子串兜底，保证消毒逻辑不漏
+            if (std::string_view(targetJobName).find("NotifyRunningApps") != std::string_view::npos) {
+                Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pBody, cbBody);
+                return;
+            }
+            break;
         }
     }
 
@@ -1517,7 +1720,9 @@ namespace {
 
         switch (eMsg) {
 
-        case k_EMsgServiceMethodResponse: {     // 147
+        case k_EMsgServiceMethod:                      // 146
+        case k_EMsgServiceMethodResponse:              // 147
+        case k_EMsgServiceMethodSendToClient: {        // 152
             CMsgProtoBufHeader hdr;
             if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name())
                 RecvServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
@@ -1534,6 +1739,7 @@ namespace {
                 pBody, cbBody);
             return;
 
+        case k_EMsgClientSharedLibraryLockStatus:      // 9405
         case k_EMsgClientSharedLibraryStopPlaying:     // 9406
             Hooks_NetPacket_FamilySharing::ClearBody(pBody, cbBody);
             return;
@@ -1557,6 +1763,18 @@ namespace {
     {
         if (eWebSocketOpCode != k_eWebSocketOpCode_Binary)
             return oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, pubData, cubData);
+
+        // Legacy CD-key request (EMsg 730) is a non-proto struct message that
+        // UnpackRaw skips. Intercept it here: if we answer it locally, suppress
+        // the real send (the 785 response is delivered from the RecvPkt hook).
+        if (cubData >= sizeof(ExtendedMsgHdr)) {
+            const uint32 rawEMsg = *reinterpret_cast<const uint32*>(pubData);
+            if (!(rawEMsg & kMsgHdrProtoFlag) &&
+                static_cast<EMsg>(rawEMsg) == k_EMsgClientGetLegacyGameKey &&
+                Hooks_NetPacket_LegacyKey::HandleSend(pubData, cubData)) {
+                return true;   // answered locally; report success so Steam treats it as sent
+            }
+        }
 
         EMsg eMsg;
         const uint8 *pHdr, *pBody;
@@ -1590,6 +1808,11 @@ namespace {
 
     HOOK_FUNC(RecvPkt, void*, void* pThis, CNetPacket* pPacket)
     {
+        // 布局没认出来之前整个收包路径都是盲的：Drain 们借 pCarrier 指针玩的
+        // 也是同一对字段。认不出就直接过原函数，一个字节都不碰。
+        if (!EnsurePacketLayout(pPacket))
+            return oRecvPkt(pThis, pPacket);
+
         Hooks_NetPacket_RichPresence::TryInject(
             pThis, pPacket,
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
@@ -1598,10 +1821,14 @@ namespace {
             pThis, pPacket,
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
 
+        Hooks_NetPacket_LegacyKey::Drain(
+            pThis, pPacket,
+            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
+
         EMsg eMsg;
         const uint8 *pBody, *pHdr;
         uint32 cbBody, cbHdr;
-        if (UnpackRaw(pPacket->m_pubData, pPacket->m_cubData,
+        if (UnpackRaw(PktData(pPacket), PktSize(pPacket),
                      eMsg, pHdr, cbHdr, pBody, cbBody)) {
             g_ResizedInPlace = false;
             RecvJob(eMsg, pBody, cbBody, pHdr, cbHdr);
@@ -1612,7 +1839,7 @@ namespace {
                     g_NewHdr, g_cbNewHdr,
                     pBody, g_NewBodySize);
             } else if (g_ResizedInPlace) {
-                pPacket->m_cubData = sizeof(MsgHdr) + cbHdr + g_NewBodySize;
+                SetPktSize(pPacket, sizeof(MsgHdr) + cbHdr + g_NewBodySize);
             } else if (g_NeedReplaceHdr || g_NeedReplaceBody) {
                 ReplaceRecvPacket(pPacket,
                     g_NeedReplaceHdr  ? g_NewHdr  : pHdr,

@@ -120,14 +120,28 @@ extern "C" {
 }
 
 // ─── 4. OpenSteamTool Injection ───────────────────────────────────
-BOOL OpenSteamToolLoad() {
+// 只在宿主是 steam.exe 时注入（不区分大小写）；本体按自身所在目录绝对
+// 路径加载（与 version.dll 代理同规则），不依赖 DLL 搜索顺序。
+BOOL OpenSteamToolLoad(HMODULE selfModule) {
     char exePath[MAX_PATH];
-    if (GetModuleFileNameA(NULL, exePath, MAX_PATH)) {
-        const char* exeName = strrchr(exePath, '\\');
-        exeName = exeName ? exeName + 1 : exePath;
-        if (_stricmp(exeName, "steam.exe") != 0) return TRUE;
-    }
-    return LoadLibraryA("OpenSteamTool.dll") != NULL;
+    const DWORD exeLen = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    // 拿不到宿主名或路径被截断（文件名不可信）就放弃注入：宁可漏注也不错杀。
+    if (exeLen == 0 || exeLen >= MAX_PATH)
+        return TRUE;
+    const char* exeName = strrchr(exePath, '\\');
+    exeName = exeName ? exeName + 1 : exePath;
+    if (_stricmp(exeName, "steam.exe") != 0)
+        return TRUE;
+
+    char selfPath[MAX_PATH + 16] = {};
+    const DWORD selfLen = GetModuleFileNameA(selfModule, selfPath, MAX_PATH);
+    if (selfLen == 0 || selfLen >= MAX_PATH)
+        return TRUE;
+    char* slash = strrchr(selfPath, '\\');
+    if (!slash)
+        return TRUE;
+    lstrcpyA(slash + 1, "OpenSteamTool.dll");
+    return LoadLibraryA(selfPath) != NULL;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved) {
@@ -135,7 +149,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         LoadRealXInput();
-        if (!OpenSteamToolLoad()) return FALSE;
+        // 本体缺失也只放弃注入，绝不返回 FALSE 连累宿主（与 version.dll 代理同规则）。
+        OpenSteamToolLoad(hModule);
         break;
     }
     return TRUE;

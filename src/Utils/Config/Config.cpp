@@ -4,8 +4,12 @@
 
 #include <toml++/toml.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <mutex>
+
+#include "OSTPlatform/include/Encoding.h"
 
 // 读 cdkey 的注册表配置用
 #ifndef WIN32_LEAN_AND_MEAN
@@ -20,13 +24,16 @@ namespace Config {
 namespace {
 
     struct Snapshot {
-        std::string manifestProvider = "opensteamtool";
+        std::string manifestProvider = "20770407";
+        bool manifestFailover = true;
         ManifestTimeouts manifestTimeouts;
         LogLevel logLevel = LogLevel::Debug;
         std::string logDir;
         std::vector<std::string> luaPaths;
-        std::string remoteUrlTemplate;
+        std::vector<std::string> remoteUrlTemplates;
+        // std::string remoteOrder = "gh-proxy-first";
         bool statsEnableApi = true;
+        std::string presenceDisplay = "spacewar";
         InjectionSettings injection;
         CloudSettings cloud;
         CdkeySettings cdkey;
@@ -34,6 +41,13 @@ namespace {
 
     std::mutex g_mutex;
     bool g_loadedOnce = false;
+
+    // order 归一化成小写再比对，避免大小写写错导致回退顺序不符合预期
+    static std::string NormalizeRemoteOrder(std::string s) {
+        for (auto& c : s)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
 
     const char* ToString(LogLevel level) {
         switch (level) {
@@ -58,26 +72,22 @@ namespace {
         manifestTimeoutConnect = snapshot.manifestTimeouts.connect;
         manifestTimeoutSend    = snapshot.manifestTimeouts.send;
         manifestTimeoutRecv    = snapshot.manifestTimeouts.recv;
+        manifestFailover       = snapshot.manifestFailover;
         logLevel               = snapshot.logLevel;
         logDir                 = snapshot.logDir;
         luaPaths               = snapshot.luaPaths;
-        remoteUrlTemplate      = snapshot.remoteUrlTemplate;
+        remoteUrlTemplates     = snapshot.remoteUrlTemplates;
+        // remoteOrder            = snapshot.remoteOrder;
         statsEnableApi         = snapshot.statsEnableApi;
+        presenceDisplay        = snapshot.presenceDisplay;
         injectEnabled          = snapshot.injection.enabled;
         injectLibraryX86       = snapshot.injection.libraryX86;
         injectLibraryX64       = snapshot.injection.libraryX64;
         cloudEnabled           = snapshot.cloud.enabled;
-        cloudLibrary           = snapshot.cloud.library;        
+        cloudLibrary           = snapshot.cloud.library;
         cdkeyBaseUrl           = snapshot.cdkey.baseUrl;
         cdkeyAuthToken         = snapshot.cdkey.authToken;
         cdkeyTimeoutMs         = snapshot.cdkey.timeoutMs;
-    }
-
-    void ApplyManifestProvider(const std::string& provider) {
-        if (!ManifestClient::SetProvider(provider)) {
-            LOG_WARN("Unknown manifest.url \"{}\", keeping default", provider);
-            ManifestClient::SetProvider("opensteamtool");
-        }
     }
 
     constexpr wchar_t kCdkeyRegistryKey[] = L"SOFTWARE\\OpenSteamTool\\CDKey";
@@ -131,6 +141,27 @@ namespace {
             LOG_WARN("cdkey registry AuthToken contains CR/LF, ignored");
     }
 
+    void ApplyManifestProvider(const std::string& provider) {
+        if (!ManifestClient::SetProvider(provider)) {
+            LOG_WARN("Unknown manifest.url \"{}\", keeping default", provider);
+            ManifestClient::SetProvider("20770407");
+        }
+    }
+
+    // WinHTTP 把零超时读成无限等待，负数经转换会回绕成极大值；
+    // 两种取值都会让单次尝试跑穿取码预算，因此在入口处钳制并告警。
+    void ReadTimeoutMs(const toml::table& manifest, const char* key, uint32_t& out) {
+        const auto val = manifest[key].value<int64_t>();
+        if (!val) return;
+
+        constexpr int64_t kMin = 1;
+        constexpr int64_t kMax = ManifestClient::kFetchBudgetMs;
+        if (*val < kMin || *val > kMax) {
+            LOG_WARN("manifest.{} = {} is outside [{}, {}], clamping", key, *val, kMin, kMax);
+        }
+        out = static_cast<uint32_t>(std::clamp<int64_t>(*val, kMin, kMax));
+    }
+
     LoadResult ApplySnapshotLocked(const Snapshot& snapshot) {
         std::lock_guard lock(g_mutex);
         LoadResult result;
@@ -143,19 +174,19 @@ namespace {
 
 } // namespace
 
-    LoadResult Load(const std::string& configPath) {
+        LoadResult Load(const std::string& configPath) {
         Snapshot snapshot = MakeDefaultSnapshot(configPath);
         ReadCdkeyRegistry(snapshot.cdkey);
         if (!std::filesystem::exists(configPath)) {
             LOG_INFO("Config file not found, using defaults");
             ApplyManifestProvider(snapshot.manifestProvider);
             LoadResult result = ApplySnapshotLocked(snapshot);
-            LOG_INFO("Config loaded: manifest.url={} log.level={} lua.paths={} stats.enable_api={} remote.url_template={}",
+            LOG_INFO("Config loaded: manifest.url={} log.level={} lua.paths={} stats.enable_api={} remote.url_templates={}",
                      ManifestClient::ActiveProviderName(),
                      ToString(GetLogLevel()),
                      (uint32_t)GetLuaPaths().size(),
                      GetStatsEnableApi(),
-                     GetRemoteUrlTemplate().empty() ? "<default>" : GetRemoteUrlTemplate());
+                     (uint32_t)GetRemoteUrlTemplates().size());
             return result;
         }
 
@@ -167,14 +198,13 @@ namespace {
                 if (auto val = (*manifest)["url"].value<std::string>()) {
                     snapshot.manifestProvider = *val;
                 }
-                if (auto val = (*manifest)["timeout_resolve_ms"].value<int64_t>())
-                    snapshot.manifestTimeouts.resolve = static_cast<uint32_t>(*val);
-                if (auto val = (*manifest)["timeout_connect_ms"].value<int64_t>())
-                    snapshot.manifestTimeouts.connect = static_cast<uint32_t>(*val);
-                if (auto val = (*manifest)["timeout_send_ms"].value<int64_t>())
-                    snapshot.manifestTimeouts.send = static_cast<uint32_t>(*val);
-                if (auto val = (*manifest)["timeout_recv_ms"].value<int64_t>())
-                    snapshot.manifestTimeouts.recv = static_cast<uint32_t>(*val);
+                if (auto val = (*manifest)["failover"].value<bool>()) {
+                    snapshot.manifestFailover = *val;
+                }
+                ReadTimeoutMs(*manifest, "timeout_resolve_ms", snapshot.manifestTimeouts.resolve);
+                ReadTimeoutMs(*manifest, "timeout_connect_ms", snapshot.manifestTimeouts.connect);
+                ReadTimeoutMs(*manifest, "timeout_send_ms", snapshot.manifestTimeouts.send);
+                ReadTimeoutMs(*manifest, "timeout_recv_ms", snapshot.manifestTimeouts.recv);
             }
 
             // [log]
@@ -199,10 +229,16 @@ namespace {
                 }
             }
 
-            // [remote]
+            // [remote] — url_template may be a single string or an array of strings.
             if (auto remote = tbl["remote"].as_table()) {
-                if (auto val = (*remote)["url_template"].value<std::string>()) {
-                    snapshot.remoteUrlTemplate = *val;
+                if (auto arr = (*remote)["url_template"].as_array()) {
+                    for (auto& elem : *arr) {
+                        if (auto str = elem.value<std::string>()) {
+                            snapshot.remoteUrlTemplates.push_back(*str);
+                        }
+                    }
+                } else if (auto val = (*remote)["url_template"].value<std::string>()) {
+                    snapshot.remoteUrlTemplates.push_back(*val);
                 }
             }
 
@@ -210,6 +246,13 @@ namespace {
             if (auto stats = tbl["stats"].as_table()) {
                 if (auto val = (*stats)["enable_api"].value<bool>()) {
                     snapshot.statsEnableApi = *val;
+                }
+            }
+
+            // [presence]
+            if (auto presence = tbl["presence"].as_table()) {
+                if (auto val = (*presence)["display"].value<std::string>()) {
+                    snapshot.presenceDisplay = *val;
                 }
             }
 
@@ -241,13 +284,16 @@ namespace {
             }
 
             ApplyManifestProvider(snapshot.manifestProvider);
+            ManifestClient::SetFailoverEnabled(snapshot.manifestFailover);
             LoadResult result = ApplySnapshotLocked(snapshot);
-            LOG_INFO("Config loaded: manifest.url={} log.level={} lua.paths={} stats.enable_api={} remote.url_template={}",
+            LOG_INFO("Config loaded: manifest.url={} manifest.failover={} log.level={} lua.paths={} stats.enable_api={} remote.url_template={} remote.order={}",
                      ManifestClient::ActiveProviderName(),
+                     ManifestClient::IsFailoverEnabled(),
                      ToString(snapshot.logLevel),
                      (uint32_t)snapshot.luaPaths.size(),
                      snapshot.statsEnableApi,
-                     snapshot.remoteUrlTemplate.empty() ? "<default>" : snapshot.remoteUrlTemplate);
+                                          (uint32_t)snapshot.remoteUrlTemplates.size());
+                     snapshot.remoteOrder);
             return result;
 
         } catch (const toml::parse_error& e) {
@@ -262,6 +308,7 @@ namespace {
         }
         if (shouldApplyDefault) {
             ApplyManifestProvider(snapshot.manifestProvider);
+            ManifestClient::SetFailoverEnabled(snapshot.manifestFailover);
             std::lock_guard lock(g_mutex);
             const bool luaChanged = luaPaths != snapshot.luaPaths;
             ApplySnapshot(snapshot);
@@ -296,10 +343,15 @@ namespace {
         return luaPaths;
     }
 
-    std::string GetRemoteUrlTemplate() {
+    std::vector<std::string> GetRemoteUrlTemplates() {
         std::lock_guard lock(g_mutex);
-        return remoteUrlTemplate;
+        return remoteUrlTemplates;
     }
+
+    // std::string GetRemoteOrder() {
+    //     std::lock_guard lock(g_mutex);
+    //     return remoteOrder;
+    // }
 
     InjectionSettings GetInjectionSettings() {
         std::lock_guard lock(g_mutex);
@@ -313,6 +365,11 @@ namespace {
     bool GetStatsEnableApi() {
         std::lock_guard lock(g_mutex);
         return statsEnableApi;
+    }
+
+    bool GetPresenceBroadcastEnabled() {
+        std::lock_guard lock(g_mutex);
+        return presenceDisplay != "none";
     }
 
     CloudSettings GetCloudSettings() {

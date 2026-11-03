@@ -53,12 +53,12 @@ namespace {
 
     static std::string AppendSnapshot(std::string message)
     {
-        message +=
-            "\n\nSteam diagnostics:\n"
-            "  OpenSteamTool version: " + g_snapshot.openSteamToolVersion + "\n"
-            "  Build ID:              " + g_snapshot.buildID + "\n"
-            "  steamclient64.dll SHA: " + g_snapshot.steamclientSha256 + "\n"
-            "  steamui.dll SHA:       " + g_snapshot.steamUISha256;
+    message +=
+        "\n\nSteam 诊断信息：\n"
+        "  OpenSteamTool 版本：" + g_snapshot.openSteamToolVersion + "\n"
+        "  构建 ID：" + g_snapshot.buildID + "\n"
+        "  steamclient64.dll SHA：" + g_snapshot.steamclientSha256 + "\n"
+        "  steamui.dll SHA：" + g_snapshot.steamUISha256;
         return message;
     }
 

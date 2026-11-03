@@ -57,6 +57,12 @@ namespace {
             return nullptr;
         }
 
+        bool HasInterface(std::string_view interfaceName) const
+        {
+            const auto it = byName.find(std::string(interfaceName));
+            return it != byName.end() && !interfaces[it->second].methods.empty();
+        }
+
         size_t MethodCount() const
         {
             size_t count = 0;
@@ -139,44 +145,65 @@ namespace {
     static void ShowMissingPopup(const std::string& sha256)
     {
         SteamDiagnostics::ShowWarning(
-            "OpenSteamTool - IPC spec missing",
-            "OpenSteamTool: IPC spec file not found.\n\n"
-            "IPC interception is disabled for this session; pattern-based "
-            "hooks are unaffected.\n\n"
-            "You can:\n"
-            "  1. Wait for the next upstream publish and restart Steam.\n"
-            "  2. Drop a matching TOML at:\n"
-            "       <Steam>\\opensteamtool\\ipc\\steamclient\\" + sha256 + ".toml\n"
-            "  3. Check upstream:\n"
-            "       https://github.com/OpenSteam001/steam-monitor/tree/ipc/steamclient");
+            "OpenSteamTool - 缺少 IPC 描述文件",
+            "OpenSteamTool：找不到 IPC 描述文件。\n\n"
+            "本会话 IPC 拦截已停用，基于特征码的 hook 不受影响。\n\n"
+            "你可以：\n"
+            "方法1：前往下方 Github 链接下载 Fluent Steam Lua 入库管理工具\n"
+            "https://github.com/huanyuejue/Fluent-Steam-Lua\n"
+            "在软件右下角工具面板的 OpenSteamTool 管理面板中一键补齐所需 Toml 文件\n"
+            "\n\n"
+            "方法2：手动去 Github 上游获取一份匹配的 TOML 放到本地的：\n"
+            "<Steam>\\opensteamtool\\ipc\\steamclient\\" + sha256 + ".toml\n"
+            "\n\n"
+            "上游地址：\n"
+            "https://github.com/huanyuejue/steam-monitor/tree/main/ipc/steamclient\n"
+            "\n\n"
+            "如仍无法解决，可按下方诊断信息反馈至：\n"
+            "https://github.com/huanyuejue/OpenSteamTool/issues");
     }
 
 } // namespace
 
 constexpr const char* kIPCChannel = "ipc";
 
-bool Load(const std::string& steamclientPath)
-{
-    g_registry.Clear();
+// 必需的接口表：我们的 handler 全在这两个下面。缺任何一个等于 IPC 票据层全灭，
+// 必须当失败处理，不能当成功糊弄过去（实测：串台的 pattern 文件会导致 0 方法 + 静默 54）。
+constexpr const char* kRequiredInterfaces[] = { "IClientUser", "IClientUtils" };
 
+static bool HasRequiredInterfaces()
+{
+    for (const char* name : kRequiredInterfaces) {
+        if (!g_registry.HasInterface(name)) return false;
+    }
+    return true;
+}
+
+// TryLoadOnce 结果分三类：Ok 直接用；Retryable（缓存有内容但坏）值得删缓存重下一次；
+// Fatal（下载失败/远端内容坏）重下也没用，直接大声失败。绝不无脑重试，避免离线时
+// 启动路径上付双倍网络超时。
+enum class TryResult { Ok, Retryable, Fatal };
+
+static TryResult TryLoadOnce(const std::string& steamclientPath, std::string& sha256, bool& fromCache, bool& allNotFound)
+{
     RemoteToml::Result r = RemoteToml::Fetch({
         kIPCChannel,
         "steamclient",
         steamclientPath,
     });
+    sha256 = r.sha256;
+    fromCache = r.fromCache;
+    allNotFound = r.allNotFound;
 
-    if (!r.ok) {
-        ShowMissingPopup(r.sha256.empty() ? "(hash failed)" : r.sha256);
-        return false;
-    }
+    if (!r.ok) return TryResult::Fatal;
 
     toml::table root;
     try {
         root = toml::parse(r.body);
     } catch (const toml::parse_error& e) {
         LOG_WARN("IPCLoader: TOML parse error: {}", e.description());
-        ShowMissingPopup(r.sha256);
-        return false;
+        // 缓存截断才值得重下；远端坏内容重下也一样。
+        return fromCache ? TryResult::Retryable : TryResult::Fatal;
     }
 
     for (auto& [key, val] : root) {
@@ -187,10 +214,53 @@ bool Load(const std::string& steamclientPath)
         g_registry.Add(std::move(iface));
     }
 
-    LOG_INFO("IPCLoader: loaded {} methods across {} interfaces ({})",
-             MethodCount(), InterfaceCount(),
-             r.fromCache ? "cache fallback" : "remote");
-    return true;
+    if (!HasRequiredInterfaces()) {
+        // 远端坏内容重下也没用；只有缓存串台才值得自愈。
+        return fromCache ? TryResult::Retryable : TryResult::Fatal;
+    }
+    return TryResult::Ok;
+}
+
+bool Load(const std::string& steamclientPath)
+{
+    g_registry.Clear();
+
+    std::string sha256;
+    bool fromCache = false;
+    bool allNotFound = false;
+    const TryResult first = TryLoadOnce(steamclientPath, sha256, fromCache, allNotFound);
+    if (first == TryResult::Ok) {
+        LOG_INFO("IPCLoader: loaded {} methods across {} interfaces ({})",
+                 MethodCount(), InterfaceCount(),
+                 fromCache ? "cache" : "remote");
+        return true;
+    }
+
+    // 自愈仅当缓存串台：删掉重下一次（上游当前给的就是对的格式，一次根治）。
+    // 下载失败/远端内容坏重下也没用，直接大声失败，不浪费启动时间。
+    // 只重试一次，避免下载循环。
+    if (first == TryResult::Retryable) {
+        LOG_WARN("IPCLoader: parsed spec missing required interfaces, dropping stale cache and refetching once");
+        RemoteToml::Invalidate({ kIPCChannel, "steamclient", steamclientPath });
+        g_registry.Clear();
+        if (TryLoadOnce(steamclientPath, sha256, fromCache, allNotFound) == TryResult::Ok) {
+            LOG_INFO("IPCLoader: self-heal ok, loaded {} methods across {} interfaces ({})",
+                     MethodCount(), InterfaceCount(),
+                     fromCache ? "cache" : "remote");
+            return true;
+        }
+    }
+
+    // 大声失败：缺文件就弹窗，不静默。
+    // 0 方法还当成功是玄学 54 的根源，绝不再静默。
+    if (allNotFound) {
+        LOG_ERROR("IPCLoader: IPC spec not published upstream, IPC interception disabled for this session");
+    } else {
+        LOG_ERROR("IPCLoader: IPC spec download failed (network or bad upstream content), "
+                  "IPC interception disabled for this session; will retry next launch");
+    }
+    ShowMissingPopup(sha256.empty() ? "(hash failed)" : sha256);
+    return false;
 }
 
 const Method* Find(EIPCInterface interfaceID, uint32_t funcHash)

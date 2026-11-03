@@ -45,6 +45,12 @@ static std::unordered_set<OSTPlatform::DynamicLibrary::ModuleHandle> g_failedMod
 // functions whose names were not found during FindPattern
 static std::vector<std::string> g_missingFunctions;
 
+// 各模块 Load() 时的请求（给缺条目自愈用：见 FindPattern）。
+static std::unordered_map<OSTPlatform::DynamicLibrary::ModuleHandle, RemoteToml::Request> g_moduleReqs;
+
+// 本会话已刷新过的模块（只一次；刷完还缺就是上游真没有，走正常缺失上报）。
+static std::unordered_set<OSTPlatform::DynamicLibrary::ModuleHandle> g_refreshedModules;
+
 // ---- byte-pattern scanner ----
 
 static bool ParseSig(const std::string& str,
@@ -149,18 +155,23 @@ static void ShowDownloadFailedPopup(const std::string& dllName,
                                     const std::string& component)
 {
     SteamDiagnostics::ShowWarning(
-        "OpenSteamTool - Unsupported Steam Version",
-        "OpenSteamTool: signature file not found for " + dllName + ".\n\n"
-        "Hooks that depend on " + dllName + " are disabled for this session; "
-        "other modules are unaffected.\n\n"
-        "You can:\n"
-        "  1. Wait for the next signature update, then restart Steam.\n"
-        "  2. Drop a matching TOML at:\n"
-        "       <Steam>\\opensteamtool\\pattern\\" + component + "\\" + sha256 + ".toml\n"
-        "  3. Check upstream:\n"
-        "       https://github.com/OpenSteam001/steam-monitor/tree/pattern/" + component + "\n"
-        "  4. Report the diagnostics below:\n"
-        "       https://github.com/OpenSteam001/OpenSteamTool/issues");
+            "OpenSteamTool - 不支持的 Steam 版本",
+            "OpenSteamTool：找不到 " + dllName + " 的签名文件。\n\n"
+            "依赖 " + dllName + " 的 hook 将在本会话中停用，"
+            "其他模块不受影响。\n\n"
+            "你可以：\n"
+            "方法1：前往下方 Github 链接下载 Fluent Steam Lua 入库管理工具\n"
+            "https://github.com/huanyuejue/Fluent-Steam-Lua\n"
+            "在软件右下角工具面板的 OpenSteamTool 管理面板中一键补齐所需 Toml 文件\n"
+            "\n\n"
+            "方法2：手动去 Github 上游获取一份匹配的 TOML 放到本地的：\n"
+            "<Steam>\\opensteamtool\\pattern\\" + component + "\\" + sha256 + ".toml\n"
+            "\n\n"
+            "上游地址：\n"
+            "https://github.com/huanyuejue/steam-monitor/tree/main/pattern/" + component + "\n"
+            "\n\n"
+            "如仍无法解决，可按下方诊断信息反馈至：\n"
+            "https://github.com/huanyuejue/OpenSteamTool/issues");
 }
 
 } // namespace
@@ -174,30 +185,51 @@ namespace PatternLoader {
 bool Load(OSTPlatform::DynamicLibrary::ModuleHandle module, const std::string& dllPath, const std::string& component)
 {
     namespace fs = std::filesystem;
+    const RemoteToml::Request req{ kPatternChannel, component, dllPath };
+    const std::string dllName = fs::path(dllPath).filename().string();
+
+    auto tryParse = [&](const RemoteToml::Result& res, PatternMap& out, std::string& err) -> bool {
+        if (!res.ok) return false;
+        out = ParsePatternString(res.body, &err);
+        return !out.empty();
+    };
 
     // Delegate fetch + cache + mirror fallback to RemoteToml.
-    RemoteToml::Result r = RemoteToml::Fetch({
-        kPatternChannel,
-        component,
-        dllPath,
-    });
+    PatternMap map;
+    std::string parseErr;
+    RemoteToml::Result r = RemoteToml::Fetch(req);
+    if (tryParse(r, map, parseErr)) {
+        LOG_INFO("PatternLoader: loaded {} patterns for {} ({})",
+                 map.size(), component, r.fromCache ? "cache" : "remote");
+        g_moduleMaps[module] = std::move(map);
+        g_moduleReqs[module] = req;
+        return true;
+    }
 
-    if (r.ok) {
-        std::string parseErr;
-        PatternMap map = ParsePatternString(r.body, &parseErr);
-        if (!map.empty()) {
-            LOG_INFO("PatternLoader: loaded {} patterns for {} ({})",
-                     map.size(), component, r.fromCache ? "cache fallback" : "remote");
+    // 自愈：只有"缓存有内容但解析空"才值得删了重下（串台文件）；
+    // 下载失败/远端坏内容重下也没用。只一次。
+    if (r.ok && r.fromCache) {
+        LOG_WARN("PatternLoader: parsed empty spec for {} ({}), dropping stale cache and refetching once",
+                 component, parseErr.empty() ? "no entries" : parseErr);
+        RemoteToml::Invalidate(req);
+        r = RemoteToml::Fetch(req);
+        parseErr.clear();
+        if (tryParse(r, map, parseErr)) {
+            LOG_INFO("PatternLoader: self-heal ok, loaded {} patterns for {} ({})",
+                     map.size(), component, r.fromCache ? "cache" : "remote");
             g_moduleMaps[module] = std::move(map);
+            g_moduleReqs[module] = req;
             return true;
         }
+    } else if (!r.ok) {
+        LOG_WARN("PatternLoader: download failed for {} (see RemoteToml log above)", component);
+    } else {
         LOG_WARN("PatternLoader: TOML for {} parsed empty ({})",
                  component, parseErr.empty() ? "no entries" : parseErr);
     }
 
-    // Total failure — popup + disable module's hooks.
-    std::string dllName = fs::path(dllPath).filename().string();
-    std::string sha     = r.sha256.empty() ? "(hash failed)" : r.sha256;
+    // 失败即弹窗：缺文件就告诉用户，不静默。
+    std::string sha = r.sha256.empty() ? "(hash failed)" : r.sha256;
     ShowDownloadFailedPopup(dllName, sha, component);
     g_failedModules.insert(module);
     return false;
@@ -226,6 +258,38 @@ void* FindPattern(OSTPlatform::DynamicLibrary::ModuleHandle module, const char* 
 
     auto& map = mapIt->second;
     auto entryIt = map.find(key);
+    if (entryIt == map.end()) {
+        // 子集缓存自愈：同一 sha 的签名文件会被上游补全，缓存按 sha 当不可变存着，
+        // 不刷就会一直缺同一批函数。每个模块每会话只刷一次：刷完还缺就是上游真没有，
+        // 走正常缺失上报。
+        // 注意这里跑在 Install 阶段里（调用方就是装 hook 的），刷完直接继续查，
+        // 补回来的条目同一次就能装上，不用等下次启动。
+        // 这次重抓发生在装 hook 的事务窗口里，慢，但每模块每会话只走一次。
+        if (!g_refreshedModules.count(module)) {
+            g_refreshedModules.insert(module);
+            const auto reqIt = g_moduleReqs.find(module);
+            if (reqIt != g_moduleReqs.end()) {
+                LOG_WARN("PatternLoader: '{}' not in cached spec, dropping possibly-stale subset and refetching once",
+                         funcName);
+                RemoteToml::Invalidate(reqIt->second);
+                RemoteToml::Result r = RemoteToml::Fetch(reqIt->second);
+                if (r.ok) {
+                    std::string refreshErr;
+                    PatternMap fresh = ParsePatternString(r.body, &refreshErr);
+                    // 非空才算数：空/坏继续用旧 map（总比没有强）。
+                    if (!fresh.empty()) {
+                        LOG_INFO("PatternLoader: subset refresh ok, {} -> {} entries ({})",
+                                 map.size(), fresh.size(), r.fromCache ? "cache" : "remote");
+                        map = std::move(fresh);
+                        entryIt = map.find(key);
+                    } else {
+                        LOG_WARN("PatternLoader: subset refresh parsed empty ({}), keeping old map",
+                                 refreshErr.empty() ? "no entries" : refreshErr);
+                    }
+                }
+            }
+        }
+    }
     if (entryIt == map.end()) {
         LOG_WARN("PatternLoader: no entry for '{}' (key=0x{:08X})", funcName, key);
         g_missingFunctions.emplace_back(funcName);
@@ -279,13 +343,13 @@ void ReportMissingFunctions()
     g_missingFunctions.clear();
 
     SteamDiagnostics::ShowWarning(
-        "OpenSteamTool - Missing Signatures",
-        "OpenSteamTool: some functions could not be located.\n\n"
-        "The following functions were not found in the signature file:\n" +
+        "OpenSteamTool - 签名缺失",
+        "OpenSteamTool：部分函数未能定位。\n\n"
+        "以下函数在签名文件中找不到：\n" +
         list +
-        "\nHooks for these functions are disabled for this session.\n\n"
-        "Please report this at:\n"
-        "https://github.com/OpenSteam001/OpenSteamTool/issues");
+        "\n这些函数的 hook 将在本会话中停用。\n\n"
+        "请按此反馈：\n"
+        "https://github.com/huanyuejue/OpenSteamTool/issues");
 }
 
 } // namespace PatternLoader

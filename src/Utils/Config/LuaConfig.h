@@ -4,6 +4,7 @@
 #include "Steam/Types.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -12,9 +13,14 @@ namespace LuaConfig{
     bool HasDepot(AppId_t appId, bool checkOwned=true);
     bool IsOwned(AppId_t appId);
     void MarkOwned(AppId_t appId);
+    // 是否配过 forcedenuvo(appid)：识别漏判时手动按 Denuvo 处理。
+    bool IsForcedDenuvo(AppId_t appId);
     std::vector<AppId_t> GetAllDepotIds();
     std::vector<uint8> GetDecryptionKey(AppId_t appId);
     uint64_t GetAccessToken(AppId_t appId);
+    // Legacy third-party CD key override for an app, if the user set one via
+    // setlegacycdkey(appid, "KEY"); nullopt when no override is configured.
+    std::optional<std::string> GetLegacyCDKey(AppId_t appId);
     uint64_t GetStatSteamId(AppId_t appId);
     bool pinApp(AppId_t appId);
     uint32_t GetPurchaseTime(AppId_t appId);

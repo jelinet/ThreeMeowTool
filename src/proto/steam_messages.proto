@@ -473,3 +473,20 @@ enum EDisplayStatus {
     k_EDisplayStatusDownloadFailed = 38;
     k_EDisplayStatusUpdateFailed = 39;
 }
+
+// ============================================================
+// CDKey 激活（Hooks_NetPacket_CDKey）：service method Store.RegisterCDKey#1
+// 来源：SteamDatabase/Protobufs steam/steammessages_store.steamclient.proto
+// 2026-10-11 由老的 CMsgClientRegisterKey / CMsgClientPurchaseResponse（eMsg 743/763）换成这个：
+// 实测客户端激活 key 发的是 Store.RegisterCDKey#1。响应里的 purchase_receipt_info
+// （CStore_PurchaseReceiptInfo）没有定义，目前只写日志用不到，未知字段会被保留不影响解析。
+// ============================================================
+message CStore_RegisterCDKey_Request {
+	optional string activation_code = 1;
+	optional int32 purchase_platform = 2;
+	optional bool is_request_from_client = 3;
+}
+
+message CStore_RegisterCDKey_Response {
+	optional int32 purchase_result_details = 1;
+}

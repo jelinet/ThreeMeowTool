@@ -20,6 +20,8 @@ namespace OSTPlatform::Process {
     std::string FormatCreationTime(uint64_t fileTime);
     std::optional<std::string> GetImagePath(uint32_t pid);
     std::optional<std::string> GetEnvironmentVariableValue(uint32_t pid, std::wstring_view name);
+    // 读目标进程的完整命令行（含参数）。读不到返回 nullopt，调用方当没配处理。
+    std::optional<std::string> GetProcessCommandLine(uint32_t pid);
     std::vector<ModuleInfo> EnumerateModules(uint32_t pid);
 
     // True when `path` lives under the OS system directory tree (on Windows,

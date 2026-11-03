@@ -2,6 +2,9 @@
 #include "HookMacros.h"
 #include "Utils/HookSupport/VehCommon.h"
 #include "dllmain.h"
+#include "OSTPlatform/include/SteamCredentialStore.h"
+#include "Utils/SteamMetadata/CDKeyReporter.h"
+#include "Utils/Config/Config.h"
 
 namespace {
     // ── Resolve-only functions ─────────────────────────────────────
@@ -15,6 +18,10 @@ namespace {
     // Assumes one game at a time.  Set by SpawnProcess VEH when -onlinefix
     // is detected; cleared when a non-onlinefix game launches.
     AppId_t   g_OnlineFixRealAppId;
+    // 游戏开始走 SteamNetworkingSockets 之后置位，见 GetAppID 处理器。
+    bool      g_NetworkingSocketsActive;
+    // 本次启动是否用 -realappid 关掉 appid 翻转，见 ShouldReportOnlineFixAppId。
+    bool      g_SuppressAppIdFlip;
     std::unordered_map<AppId_t, std::string> g_GameNameCache;
 
 
@@ -24,7 +31,6 @@ namespace {
     // arg1=pCUser, arg2=pExePath, arg3=pCommandLine, arg4=pWorkingDir
     // arg5=pGameID (CGameID*; low 24 bits = AppId)
     static void OnSpawnProcessHit(OSTPlatform::Trap::Context& ctx, const VehCommon::Int3Site& /*site*/) {
-        
         CGameID* pGameID = VehCommon::GetArg<CGameID*>(ctx, 5);
         AppId_t appId = static_cast<AppId_t>(pGameID->AppID(true));
         const char* cmdLine = VehCommon::GetArg<const char*>(ctx, 3);
@@ -111,14 +117,24 @@ namespace {
                 }
             }
         }
+        // 每次命中均记录启动参数，用于区分 hook 未触发与启动参数缺失两种情况。
+        LOG_MISC_DEBUG("SpawnProcess hit: appid {} cmd=\"{}\"", appId, cmdLine ? cmdLine : "<null>");
 
-        if (LuaConfig::HasDepot(appId) && cmdLine && strstr(cmdLine, "-onlinefix")) 
+        // 只看启动参数，不再要求 appid 在 Lua 名单里：正版玩家加 -onlinefix
+        // 联机同样要生效，解锁名单不该决定联机开关。
+        if (cmdLine && strstr(cmdLine, "-onlinefix"))
         {
             g_OnlineFixRealAppId = appId;
+            g_NetworkingSocketsActive = false;
+            // 逐局关闭 appid 翻转：启动期就要读自己 appid 的游戏会卡在黑屏，
+            // 这个调用本身分不出游戏意图，只能交给用户按局指定。
+            g_SuppressAppIdFlip = strstr(cmdLine, "-realappid") != nullptr;
             pGameID->SetAppID(kOnlineFixAppId);
-            LOG_MISC_INFO("SpawnProcess: appid {} -> {}, cmd=\"{}\"",appId, kOnlineFixAppId, cmdLine);
+            LOG_MISC_INFO("SpawnProcess: appid {} -> {}, realappid={}, cmd=\"{}\"",
+                          appId, kOnlineFixAppId, g_SuppressAppIdFlip, cmdLine);
         } else {
             g_OnlineFixRealAppId = 0;
+            g_SuppressAppIdFlip = false;
         }
     }
 
@@ -223,6 +239,27 @@ namespace Hooks_Misc {
     AppId_t ResolveAppId() {
         if (g_OnlineFixRealAppId) return g_OnlineFixRealAppId;
         return GetAppIDForCurrentPipeWrap();
+    }
+
+    bool IsOnlineFixActive() {
+        return g_OnlineFixRealAppId != 0;
+    }
+
+    void NotifyNetworkingSocketsUsed() {
+        if (g_OnlineFixRealAppId && !g_NetworkingSocketsActive) {
+            g_NetworkingSocketsActive = true;
+            LOG_MISC_INFO("NetworkingSockets active: GetAppID now reports {}",
+                          g_SuppressAppIdFlip ? "real appid (-realappid)" : "480 for cert match");
+        }
+    }
+
+    bool ShouldReportOnlineFixAppId() {
+        // 翻转的用途是让 P2P socket 的 appid 与 480 会话证书对上，部分游戏靠它联机。
+        // 但它一旦触发，本进程余下生命周期里每次询问都答 480；另一些游戏在启动期
+        // 问同一句话拿到 480 就会卡死或黑屏。两侧都有游戏需要，而这个调用本身
+        // 分不出对方是哪一类，于是用 -realappid 逐局退出。
+        if (g_SuppressAppIdFlip) return false;
+        return g_OnlineFixRealAppId != 0 && g_NetworkingSocketsActive;
     }
     
     bool EnsureBufferCapacity(CUtlBuffer* pWrite, uint32 newCapacity,bool updatePut)

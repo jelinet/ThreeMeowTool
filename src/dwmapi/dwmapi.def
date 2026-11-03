@@ -1,0 +1,39 @@
+LIBRARY "dwmapi"
+EXPORTS
+    ; Ordinals mirror the system dwmapi.dll so ordinal-based importers still resolve.
+    ; Only public named entry points are exported: in this Steam install only
+    ; bin\vgui2_s.dll imports dwmapi by name (DwmExtendFrameIntoClientArea /
+    ; DwmSetWindowAttribute) and nothing imports by ordinal. The private Dwmp* /
+    ; DwmTetherTextContact (no known signature, unused) and the COM entry points
+    ; (resolved via registry to System32) are intentionally omitted.
+    DwmAttachMilContent @116
+    DwmDefWindowProc @117
+    DwmDetachMilContent @118
+    DwmEnableBlurBehindWindow @119
+    DwmEnableComposition @102
+    DwmEnableMMCSS @120
+    DwmExtendFrameIntoClientArea @121
+    DwmFlush @122
+    DwmGetColorizationColor @123
+    DwmGetCompositionTimingInfo @125
+    DwmGetGraphicsStreamClient @126
+    DwmGetGraphicsStreamTransformHint @129
+    DwmGetTransportAttributes @130
+    DwmGetUnmetTabRequirements @133
+    DwmGetWindowAttribute @134
+    DwmInvalidateIconicBitmaps @146
+    DwmIsCompositionEnabled @149
+    DwmModifyPreviousDxFrameDuration @198
+    DwmQueryThumbnailSourceSize @205
+    DwmRegisterThumbnail @206
+    DwmRenderGesture @207
+    DwmSetDxFrameDuration @208
+    DwmSetIconicLivePreviewBitmap @209
+    DwmSetIconicThumbnail @210
+    DwmSetPresentParameters @211
+    DwmSetWindowAttribute @212
+    DwmShowContact @213
+    DwmTetherContact @214
+    DwmTransitionOwnedWindow @215
+    DwmUnregisterThumbnail @216
+    DwmUpdateThumbnailProperties @217

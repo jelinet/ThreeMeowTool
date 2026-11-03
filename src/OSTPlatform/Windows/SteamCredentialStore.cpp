@@ -14,6 +14,7 @@ namespace {
 
 constexpr const wchar_t* kValueSteamId = L"SteamID";
 constexpr const wchar_t* kValueAppTicket = L"AppTicket";
+constexpr const wchar_t* kValueAppTicketExpTime = L"AppTicketExpTime";
 constexpr const wchar_t* kValueEncryptedTicket = L"ETicket";
 constexpr const wchar_t* kActiveProcessKeyPath = L"Software\\Valve\\Steam\\ActiveProcess";
 constexpr const wchar_t* kValueActiveUser = L"ActiveUser";
@@ -21,7 +22,7 @@ constexpr const wchar_t* kValueUniverse = L"Universe";
 constexpr const wchar_t* kValueDenuvo = L"Denuvo";   //判断
 constexpr const wchar_t* kValueDenuvoExpired = L"DenuvoExpired";   //判断
 constexpr const wchar_t* kValueSteamDrm = L"SteamDrm";   //判断
-constexpr const wchar_t* kValueCDKey = L"CDKey";
+constexpr const wchar_t* kValueCDKey = L"CDKey";   //判断
 
 std::wstring SteamAppKeyPath(uint32_t appId) {
     return L"Software\\Valve\\Steam\\Apps\\" + std::to_wstring(appId);
@@ -33,6 +34,11 @@ const char* ValueNameForLog(PCWSTR valueName) {
     if (valueName == kValueEncryptedTicket) return "ETicket";
     if (valueName == kValueActiveUser) return "ActiveUser";
     if (valueName == kValueUniverse) return "Universe";
+    if (valueName == kValueDenuvo) return "Denuvo";
+    if (valueName == kValueDenuvoExpired) return "DenuvoExpired";
+    if (valueName == kValueSteamDrm) return "SteamDrm";
+    if (valueName == kValueCDKey) return "CDKey";
+    if (valueName == kValueAppTicketExpTime) return "AppTicketExpTime";
     return "?";
 }
 
@@ -379,4 +385,5 @@ Status WriteAppTicketExpTime(uint32_t appId, uint64_t expiresAt) {
     return FromLStatus(WriteValue(appId, kValueAppTicketExpTime, REG_QWORD,
                                   reinterpret_cast<const BYTE*>(&value), sizeof(value)));
 }
+
 } // namespace OSTPlatform::SteamCredentialStore

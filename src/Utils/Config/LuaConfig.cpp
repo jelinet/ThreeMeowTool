@@ -24,10 +24,13 @@ namespace LuaConfig{
     static bool g_hasManifestCodeFuncEx = false;
     std::unordered_map<AppId_t, std::string>DepotKeySet{};
     std::unordered_map<AppId_t, uint64_t>AccessTokenSet{};
+    std::unordered_map<AppId_t, std::string>LegacyCDKeySet{};
     std::unordered_set<AppId_t> PinnedApps{};
     std::unordered_map<uint64_t, ManifestOverride> ManifestOverrides{};
     std::unordered_map<AppId_t, uint64_t> StatSteamIdSet{};
     std::unordered_set<AppId_t> OwnedAppIdSet{};
+    // forcedenuvo(appid)：识别漏判时手动指定该游戏按 Denuvo 处理。
+    std::unordered_set<AppId_t> ForcedDenuvoSet{};
 
     // Per-file tracking: which depots each .lua file contributed.
     static std::string g_currentFile;
@@ -266,6 +269,28 @@ namespace LuaConfig{
         return 0;
     }
 
+    static int lua_setlegacycdkey(lua_State* L) {
+        // setlegacycdkey(integer appid, string key)
+        int argc = lua_gettop(L);
+        if (argc < 2) {
+            return luaL_error(L, "");
+        }
+        if (!lua_isinteger(L, 1)) {
+            return luaL_error(L, "");
+        }
+        // Read the first argument as appid.
+        lua_Integer value = lua_tointeger(L, 1);
+        if (value < 0 || value > UINT32_MAX)
+            return luaL_error(L, "");
+        AppId_t AppId = (uint32_t)value;
+        // Read the second argument as the CD key, stored verbatim.
+        if (!lua_isstring(L, 2))
+            return luaL_error(L, "");
+        LegacyCDKeySet[AppId] = lua_tostring(L, 2);
+
+        return 0;
+    }
+
     static int lua_pinApp(lua_State* L) {
         // pinApp(integer)
         int argc = lua_gettop(L);
@@ -418,6 +443,19 @@ namespace LuaConfig{
         return 0;
     }
 
+    // ── Lua: forcedenuvo ────────────────────────────────────────
+    static int lua_forcedenuvo(lua_State* L) {
+        // forcedenuvo(appid) — 识别没认出来的 D 加密游戏用这个手动指定，
+        // 跳过保护扫描直接按 Denuvo 走授权。只影响识别，不改授权行为。
+        if (lua_gettop(L) < 1 || !lua_isinteger(L, 1))
+            return luaL_error(L, "forcedenuvo requires (appid: integer)");
+        lua_Integer val = lua_tointeger(L, 1);
+        if (val <= 0 || val > UINT32_MAX)
+            return luaL_error(L, "forcedenuvo: appid out of range");
+        ForcedDenuvoSet.insert(static_cast<AppId_t>(val));
+        return 0;
+    }
+
     // ── init / cleanup ───────────────────────────────────────────
     static bool Initialize() {
         if (g_lua_state)
@@ -443,6 +481,7 @@ namespace LuaConfig{
         // (e.g. setAppTICKET, addAppId, SETManifestid, etc.).
         register_func(g_lua_state, "addappid", lua_addappid);
         register_func(g_lua_state, "addtoken", lua_addtoken);
+        register_func(g_lua_state, "setlegacycdkey", lua_setlegacycdkey);
         // we don't need it?
         // register_func(g_lua_state, "pinapp", lua_pinApp);
         register_func(g_lua_state, "setmanifestid", lua_setManifestid);
@@ -451,6 +490,7 @@ namespace LuaConfig{
         register_func(g_lua_state, "setappticket", lua_setAppticket);
         register_func(g_lua_state, "seteticket", lua_setEticket);
         register_func(g_lua_state, "setstat", lua_setStat);
+        register_func(g_lua_state, "forcedenuvo", lua_forcedenuvo);
         return true;
     }
 
@@ -469,6 +509,10 @@ namespace LuaConfig{
 
     bool IsOwned(AppId_t AppId) {
         return OwnedAppIdSet.count(AppId);
+    }
+
+    bool IsForcedDenuvo(AppId_t AppId) {
+        return ForcedDenuvoSet.count(AppId) != 0;
     }
 
     void MarkOwned(AppId_t AppId) {
@@ -503,6 +547,13 @@ namespace LuaConfig{
             return AccessTokenSet[AppId];
         }
         return 0;
+    }
+
+    std::optional<std::string> GetLegacyCDKey(AppId_t AppId) {
+        auto it = LegacyCDKeySet.find(AppId);
+        if (it != LegacyCDKeySet.end())
+            return it->second;
+        return std::nullopt;
     }
 
     bool pinApp(AppId_t AppId) {

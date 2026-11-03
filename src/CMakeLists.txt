@@ -19,6 +19,10 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
+# Sources are UTF-8 without BOM (box-drawing comments). Force UTF-8 so the
+# build does not depend on the host system codepage (e.g. GBK on CN Windows).
+add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+
 
 if(NOT WIN32)
     message(STATUS "OpenSteamTool: no targets on non-Windows platforms; skipping.")
@@ -103,6 +107,7 @@ add_library(OpenSteamTool SHARED
 
     # Shared utilities
     Utils/Tickets/AppTicket.cpp
+    Utils/Tickets/LegacyCDKey.cpp
     Utils/Config/Config.cpp
     Utils/Config/ConfigFileWatcher.cpp
     Utils/Config/LuaConfig.cpp
@@ -110,6 +115,7 @@ add_library(OpenSteamTool SHARED
     Utils/CloudRedirect/CloudRedirectHost.cpp
     Utils/HookSupport/VehCommon.cpp
     Utils/Logging/Log.cpp
+    Utils/SteamMetadata/CDKeyReporter.cpp
     Utils/SteamMetadata/IPCLoader.cpp
     Utils/SteamMetadata/ManifestClient.cpp
     Utils/SteamMetadata/PatternLoader.cpp
@@ -169,10 +175,15 @@ target_compile_definitions(OpenSteamTool PRIVATE
 )
 
 # ---------------------------------------------------------------------------
-# dwmapi.dll hijack — small loader DLL placed alongside Steam.
+# dwmapi.dll hijack — anti-cheat friendly loader DLL.
+# Steam 的 bin\vgui2_s.dll 静态导入 dwmapi，本代理被它连带加载进 steam.exe，
+# 于是反作弊不拦系统 DLL 名时也能把 OpenSteamTool 带进进程。这里不能用
+# linker forwarder（DWMAPI.* 会命中同名自环，vgui2_s 加载失败 VGUI_Setup failed），
+# 改为运行期 GetProcAddress 转发到系统 dwmapi——见 dwmapi/dwmapi.cpp。
 # ---------------------------------------------------------------------------
 add_library(dwmapi SHARED
     dwmapi/dwmapi.cpp
+    dwmapi/dwmapi.def
 )
 
 # ---------------------------------------------------------------------------
@@ -182,3 +193,15 @@ add_library(xinput1_4 SHARED
     xinput1_4/xinput1_4.cpp
     xinput1_4/xinput1_4.def
 )
+
+# ---------------------------------------------------------------------------
+# version.dll hijack — 早注隔离专用入口。steam.exe 静态导入 VERSION.dll，
+# 本代理随加载器最先进入进程，能抢在 steamclient64 首载之前架好重定向。
+# 但反作弊会拦 Steam 目录下这个未签名的 version.dll，所以默认禁用：产物直接
+# 带 .disabled 后缀，steam.exe 静态导入时找不到它、回退系统 version.dll，从而
+# 不触发反作弊；需要早注隔离时由工具侧去掉后缀再启用。
+# ---------------------------------------------------------------------------
+add_library(version SHARED
+    version/version.cpp
+)
+set_target_properties(version PROPERTIES SUFFIX ".dll.disabled")
