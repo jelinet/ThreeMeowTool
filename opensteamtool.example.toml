@@ -119,14 +119,20 @@ enabled = false
 # library = "cloud_redirect.dll"
 
 [remote]
-# Optional metadata mirror. Leave unset to use gh-proxy with GitHub fallback.
-# A custom mirror replaces the built-in remote sources and must include all
-# three placeholders: {channel}, {component}, and {sha256}.
+# 签名/IPC 描述文件（pattern / ipc 的 TOML）的下载地址。
 #
-# Built-in mirror order (default: gh-proxy-first).
-#   "gh-proxy-first" → try gh-proxy first, fall back to GitHub raw
-#   "github-first"   → try GitHub raw first, fall back to gh-proxy
-# order = "gh-proxy-first"
+# 查找顺序：
+#   1. 先读本地缓存 <Steam>\opensteamtool\<channel>\<component>\<sha256>.toml，命中就不联网
+#   2. 缓存没有，按 url_template 数组顺序逐个下载，第一个成功的写入缓存并使用
+#      - HTTP 404：直接换下一个，不重试
+#      - 超时/连不上等网络失败：同一个地址重试一次，仍失败再换下一个
 #
+# 可以写单个字符串，也可以写数组。每一项都必须包含 {channel}、{component}、{sha256}
+# 三个占位符，缺占位符的项会被跳过。填了就完全替换内置地址。
+# 不填时使用内置地址：jsDelivr → gh-proxy（GitHub raw）。
+#
+# url_template = [
+#     "https://cdn.jsdelivr.net/gh/huanyuejue/steam-monitor@{channel}/{component}/{sha256}.toml",
+#     "https://gh-proxy.com/https://raw.githubusercontent.com/huanyuejue/steam-monitor/main/{channel}/{component}/{sha256}.toml",
+# ]
 # url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
-# url_template = "https://fast.jsdelivr.net/gh/OpenSteam001/steam-monitor@{channel}/{component}/{sha256}.toml"

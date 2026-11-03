@@ -145,22 +145,15 @@ namespace {
     static void ShowMissingPopup(const std::string& sha256)
     {
         SteamDiagnostics::ShowWarning(
-            "OpenSteamTool - 缺少 IPC 描述文件",
-            "OpenSteamTool：找不到 IPC 描述文件。\n\n"
-            "本会话 IPC 拦截已停用，基于特征码的 hook 不受影响。\n\n"
+            "Steam - 缺少 IPC 描述文件",
+            "Steam：找不到 IPC 描述文件。\n\n"
             "你可以：\n"
-            "方法1：前往下方 Github 链接下载 Fluent Steam Lua 入库管理工具\n"
-            "https://github.com/huanyuejue/Fluent-Steam-Lua\n"
-            "在软件右下角工具面板的 OpenSteamTool 管理面板中一键补齐所需 Toml 文件\n"
-            "\n\n"
-            "方法2：手动去 Github 上游获取一份匹配的 TOML 放到本地的：\n"
-            "<Steam>\\opensteamtool\\ipc\\steamclient\\" + sha256 + ".toml\n"
-            "\n\n"
-            "上游地址：\n"
-            "https://github.com/huanyuejue/steam-monitor/tree/main/ipc/steamclient\n"
-            "\n\n"
-            "如仍无法解决，可按下方诊断信息反馈至：\n"
-            "https://github.com/huanyuejue/OpenSteamTool/issues");
+            "  1. 确认网络畅通\n"
+            "  2. 查询店铺飞书文档，内有解决方案\n"
+            "  3. 确认 Steam 已更新到最新版本 \n"
+            "  4. 重启 Steam\n"
+            "如仍无法解决，可反馈客服\n"
+            );
     }
 
 } // namespace
@@ -254,7 +247,7 @@ bool Load(const std::string& steamclientPath)
     // 大声失败：缺文件就弹窗，不静默。
     // 0 方法还当成功是玄学 54 的根源，绝不再静默。
     if (allNotFound) {
-        LOG_ERROR("IPCLoader: IPC spec not published upstream, IPC interception disabled for this session");
+        LOG_ERROR("IPCLoader: IPC spec download failed: all mirrors returned HTTP 404, IPC interception disabled for this session");
     } else {
         LOG_ERROR("IPCLoader: IPC spec download failed (network or bad upstream content), "
                   "IPC interception disabled for this session; will retry next launch");

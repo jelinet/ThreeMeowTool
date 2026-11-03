@@ -155,23 +155,14 @@ static void ShowDownloadFailedPopup(const std::string& dllName,
                                     const std::string& component)
 {
     SteamDiagnostics::ShowWarning(
-            "OpenSteamTool - 不支持的 Steam 版本",
-            "OpenSteamTool：找不到 " + dllName + " 的签名文件。\n\n"
-            "依赖 " + dllName + " 的 hook 将在本会话中停用，"
-            "其他模块不受影响。\n\n"
+            "Steam - 不支持的 Steam 版本",
+            "Steam " + dllName + " 的签名文件。\n\n"
             "你可以：\n"
-            "方法1：前往下方 Github 链接下载 Fluent Steam Lua 入库管理工具\n"
-            "https://github.com/huanyuejue/Fluent-Steam-Lua\n"
-            "在软件右下角工具面板的 OpenSteamTool 管理面板中一键补齐所需 Toml 文件\n"
-            "\n\n"
-            "方法2：手动去 Github 上游获取一份匹配的 TOML 放到本地的：\n"
-            "<Steam>\\opensteamtool\\pattern\\" + component + "\\" + sha256 + ".toml\n"
-            "\n\n"
-            "上游地址：\n"
-            "https://github.com/huanyuejue/steam-monitor/tree/main/pattern/" + component + "\n"
-            "\n\n"
-            "如仍无法解决，可按下方诊断信息反馈至：\n"
-            "https://github.com/huanyuejue/OpenSteamTool/issues");
+            "  1. 确认网络畅通\n"
+            "  2. 查询店铺飞书文档，内有解决方案\n"
+            "  3. 确认 Steam 已更新到最新版本 \n"
+            "  4. 重启 Steam\n"
+            "如仍无法解决，可反馈客服\n");
 }
 
 } // namespace
@@ -343,13 +334,16 @@ void ReportMissingFunctions()
     g_missingFunctions.clear();
 
     SteamDiagnostics::ShowWarning(
-        "OpenSteamTool - 签名缺失",
-        "OpenSteamTool：部分函数未能定位。\n\n"
+        "Steam - 签名缺失",
+        "Steam：部分函数未能定位。\n\n"
         "以下函数在签名文件中找不到：\n" +
         list +
-        "\n这些函数的 hook 将在本会话中停用。\n\n"
-        "请按此反馈：\n"
-        "https://github.com/huanyuejue/OpenSteamTool/issues");
+        "你可以：\n"
+        "  1. 确认网络畅通\n"
+        "  2. 查询店铺飞书文档，内有解决方案\n"
+        "  3. 确认 Steam 已更新到最新版本 \n"
+        "  4. 重启 Steam\n"
+        "如仍无法解决，可反馈客服\n");
 }
 
 } // namespace PatternLoader

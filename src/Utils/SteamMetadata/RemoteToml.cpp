@@ -74,6 +74,14 @@ namespace {
             LOG_WARN("RemoteToml: no valid remote.url_template entries; remote fetch disabled");
         return out;
     }
+    // <Steam>/opensteamtool/<channel>/<component>/<sha256>.toml
+    // Fetch 和 Invalidate 共用，保证"写的"和"删的"是同一个文件。
+    static std::filesystem::path CachePathFor(const Request& request, std::string_view sha256)
+    {
+        return std::filesystem::path(request.dllPath).parent_path() /
+               "opensteamtool" / request.channel / request.component /
+               (std::string(sha256) + ".toml");
+    }
 } // namespace
 
 Result Fetch(const Request& request)
@@ -96,9 +104,8 @@ Result Fetch(const Request& request)
              request.channel, request.component, out.sha256, hashMs);
 
     // 2. Cache path & dir.
-    fs::path steamRoot = fs::path(request.dllPath).parent_path();
-    fs::path cacheDir  = steamRoot / "opensteamtool" / request.channel / request.component;
-    fs::path cachePath = cacheDir / (out.sha256 + ".toml");
+    const fs::path cachePath = CachePathFor(request, out.sha256);
+    const fs::path cacheDir  = cachePath.parent_path();
     const std::string cachePathText = cachePath.string();
 
     std::error_code mkdirEc;
@@ -108,10 +115,44 @@ Result Fetch(const Request& request)
                  request.channel, request.component, cacheDir.string(), mkdirEc.message());
     }
 
-    // 3. Try remote (mirror chain with early-out on 404).
+    // 3. Cache first.
+    // 文件按 DLL SHA-256 命名，同一个 SHA 的内容视为不可变，命中就直接用、不发网络请求，
+    // 避免远端超时拖慢 hook 安装（2026-11-03 对齐 OpenSteamTool 的做法）。
+    // 之前（照搬 HaiphubSteamTool）是远端优先、失败才读缓存：那样 fromCache=true 只代表
+    // "远端挂了"，PatternLoader/IPCLoader 的"缓存解析为空 → Invalidate → 重下"自愈就失去前提。
+    // 缓存内容真有问题时由调用方 Invalidate 后重新 Fetch，见 PatternLoader.cpp / IPCLoader.cpp。
+    {
+        std::error_code ec;
+        if (fs::exists(cachePath, ec) && !ec) {
+            const auto size = fs::file_size(cachePath, ec);
+            if (!ec && size > 0) {
+                std::ifstream ifs(cachePath, std::ios::binary);
+                if (ifs) {
+                    std::string buf((std::istreambuf_iterator<char>(ifs)),
+                                     std::istreambuf_iterator<char>());
+                    if (!buf.empty()) {
+                        LOG_INFO("RemoteToml({}/{}): loaded from cache {}",
+                                 request.channel, request.component, cachePathText);
+                        out.body = std::move(buf);
+                        out.ok = true;
+                        out.fromCache = true;
+                        return out;
+                    }
+                }
+            }
+            LOG_WARN("RemoteToml({}/{}): cache file exists but unreadable or empty, going remote: {}",
+                     request.channel, request.component, cachePathText);
+        }
+    }
+
+    // 4. Cache miss → try remote, in url_template array order.
+    // 镜像是相互独立的仓库/主机，覆盖范围可能不同，一个 404 不代表其他的也没有，所以总是试下一个。
+    // 传输失败（超时/连不上/非 404 的非 200）同一个地址再打一次：跨境链路偶发抖动很常见，一次重试就能救回；
+    // 404 不重试，重下也还是没有。重试封顶一次，不在启动路径上烧时间。GET 无副作用，重试是安全的。
     const std::vector<std::string> urlTemplates = BuildUrlTemplates();
     OSTPlatform::Http::Result http;
     std::string lastUrl;
+    size_t notFoundCount = 0;
 
     for (size_t i = 0; i < urlTemplates.size(); ++i) {
         lastUrl = ExpandTemplate(urlTemplates[i], request, out.sha256);
@@ -121,67 +162,105 @@ Result Fetch(const Request& request)
         http = OSTPlatform::Http::Execute(L"GET", lastUrl.c_str(),
                                           nullptr, 0, nullptr);
 
-        if (http.ok && http.status == 200) break;
+        const bool is404   = http.ok && http.status == 404;
+        const bool gotBody = http.ok && http.status == 200 && !http.body.empty();
+        if (!gotBody && !is404) {
+            LOG_INFO("RemoteToml({}/{}): transport failed ({} ok={} HTTP={}), retrying once",
+                     request.channel, request.component, lastUrl, http.ok, http.status);
+            http = OSTPlatform::Http::Execute(L"GET", lastUrl.c_str(),
+                                              nullptr, 0, nullptr);
+        }
 
-        // Mirrors are independent repos with possibly different coverage, so a 404
-        // (or any non-200) on one does NOT imply the others lack the file — always
-        // fall through to the next mirror.
-        if (i + 1 < urlTemplates.size()) {
-            LOG_WARN("RemoteToml({}/{}): mirror failed ({} ok={} HTTP={}), trying next",
-                     request.channel, request.component, lastUrl, http.ok, http.status);
+        if (http.ok && http.status == 200 && !http.body.empty()) break;
+
+        const char* next = (i + 1 < urlTemplates.size()) ? ", trying next" : ", no more mirrors";
+        if (http.ok && http.status == 200) {
+            LOG_WARN("RemoteToml({}/{}): mirror returned empty body: {}{}",
+                     request.channel, request.component, lastUrl, next);
+        } else if (http.ok && http.status == 404) {
+            ++notFoundCount;
+            LOG_WARN("RemoteToml({}/{}): mirror returned HTTP 404: {}{}",
+                     request.channel, request.component, lastUrl, next);
         } else {
-            LOG_WARN("RemoteToml({}/{}): mirror failed ({} ok={} HTTP={}), no more mirrors",
-                     request.channel, request.component, lastUrl, http.ok, http.status);
+            LOG_WARN("RemoteToml({}/{}): mirror failed after retry ({} ok={} HTTP={}){}",
+                     request.channel, request.component, lastUrl, http.ok, http.status, next);
         }
     }
 
-    // 4. Remote OK → write cache, return body.
+    // 5. Remote OK → write cache, return body.
     if (http.ok && http.status == 200 && !http.body.empty()) {
-        std::ofstream ofs(cachePath, std::ios::binary);
-        if (ofs) {
-            ofs.write(http.body.data(),
-                      static_cast<std::streamsize>(http.body.size()));
+        // 先写 .tmp 再改名：写到一半崩溃/断电只会留下 .tmp，不会留下被截断的正式缓存
+        // （缓存优先之后，截断的缓存会被一直命中，比没缓存更糟）。
+        fs::path tmpPath = cachePath;
+        tmpPath += ".tmp";
+        std::error_code writeEc;
+        {
+            std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+            if (ofs) {
+                ofs.write(http.body.data(),
+                          static_cast<std::streamsize>(http.body.size()));
+                ofs.close();
+            }
+            if (!ofs)
+                writeEc = std::make_error_code(std::errc::io_error);
+        }
+        if (!writeEc) {
+            fs::remove(cachePath, writeEc);   // 目标不存在时 remove 返回 false 但不报错
+            if (!writeEc)
+                fs::rename(tmpPath, cachePath, writeEc);
+        }
+        if (writeEc) {
+            LOG_WARN("RemoteToml({}/{}): could not write cache {} ({})",
+                     request.channel, request.component, cachePathText, writeEc.message());
+            std::error_code cleanupEc;
+            fs::remove(tmpPath, cleanupEc);
+        } else {
             LOG_INFO("RemoteToml({}/{}): cached to {}",
                      request.channel, request.component, cachePathText);
-        } else {
-            LOG_WARN("RemoteToml({}/{}): could not open {} for writing",
-                     request.channel, request.component, cachePathText);
         }
+        // 缓存写失败不影响这次使用，下次启动会重新下载。
         out.body = std::move(http.body);
         out.ok = true;
         return out;
     }
 
-    // 5. Remote failed → fall back to whatever is cached for this exact SHA.
-    if (fs::exists(cachePath)) {
-        LOG_WARN("RemoteToml({}/{}): remote failed (last URL {} HTTP {}); "
-                 "falling back to local cache {}",
-                 request.channel, request.component,
-                 lastUrl.empty() ? "<none>" : lastUrl, http.status, cachePathText);
-
-        std::ifstream ifs(cachePath, std::ios::binary);
-        if (ifs) {
-            std::string buf((std::istreambuf_iterator<char>(ifs)),
-                             std::istreambuf_iterator<char>());
-            if (!buf.empty()) {
-                out.body = std::move(buf);
-                out.ok = true;
-                out.fromCache = true;
-                return out;
-            }
-            LOG_WARN("RemoteToml({}/{}): cache file empty: {}",
-                     request.channel, request.component, cachePathText);
-        } else {
-            LOG_WARN("RemoteToml({}/{}): could not open cache file: {}",
-                     request.channel, request.component, cachePathText);
-        }
-    }
-
     // 6. Total failure — caller handles popup / degraded mode.
-    LOG_WARN("RemoteToml({}/{}): no source available (last URL: {} HTTP {})",
-             request.channel, request.component,
-             lastUrl.empty() ? "<none>" : lastUrl, http.status);
+    // allNotFound 只给调用方区分日志措辞（全 404 vs 网络问题），不影响是否弹窗。
+    // 至少试过一个镜像才算：模板全配错导致一个都没试，属于配置问题，不算全 404。
+    out.allNotFound = !urlTemplates.empty() && notFoundCount == urlTemplates.size();
+    if (out.allNotFound) {
+        LOG_WARN("RemoteToml({}/{}): all {} mirrors returned HTTP 404 (last URL: {})",
+                 request.channel, request.component, urlTemplates.size(), lastUrl);
+    } else {
+        LOG_WARN("RemoteToml({}/{}): no source available (last URL: {} HTTP {})",
+                 request.channel, request.component,
+                 lastUrl.empty() ? "<none>" : lastUrl, http.status);
+    }
     return out;
+}
+
+bool Invalidate(const Request& request)
+{
+    namespace fs = std::filesystem;
+    const std::string sha256 = SteamDiagnostics::Sha256Of(request.dllPath);
+    if (sha256.empty()) {
+        LOG_WARN("RemoteToml({}/{}): Invalidate skipped, Sha256OfFile failed for {}",
+                 request.channel, request.component, request.dllPath);
+        return false;
+    }
+    const fs::path cachePath = CachePathFor(request, sha256);
+    std::error_code ec;
+    const bool removed = fs::remove(cachePath, ec);
+    if (ec) {
+        LOG_WARN("RemoteToml({}/{}): failed to remove stale cache {} ({})",
+                 request.channel, request.component, cachePath.string(), ec.message());
+        return false;
+    }
+    if (removed) {
+        LOG_WARN("RemoteToml({}/{}): removed stale cache {}",
+                 request.channel, request.component, cachePath.string());
+    }
+    return removed;
 }
 
 } // namespace RemoteToml
