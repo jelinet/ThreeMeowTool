@@ -286,14 +286,13 @@ namespace {
             ApplyManifestProvider(snapshot.manifestProvider);
             ManifestClient::SetFailoverEnabled(snapshot.manifestFailover);
             LoadResult result = ApplySnapshotLocked(snapshot);
-            LOG_INFO("Config loaded: manifest.url={} manifest.failover={} log.level={} lua.paths={} stats.enable_api={} remote.url_template={} remote.order={}",
+            LOG_INFO("Config loaded: manifest.url={} manifest.failover={} log.level={} lua.paths={} stats.enable_api={} remote.url_template={}",
                      ManifestClient::ActiveProviderName(),
                      ManifestClient::IsFailoverEnabled(),
                      ToString(snapshot.logLevel),
                      (uint32_t)snapshot.luaPaths.size(),
                      snapshot.statsEnableApi,
-                                          (uint32_t)snapshot.remoteUrlTemplates.size());
-                     snapshot.remoteOrder);
+                     (uint32_t)snapshot.remoteUrlTemplates.size());
             return result;
 
         } catch (const toml::parse_error& e) {
