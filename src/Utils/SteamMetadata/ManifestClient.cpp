@@ -44,14 +44,14 @@ namespace ManifestClient {
 
     struct Provider {
         std::string_view name;          // matches [manifest] url = "..."
-        // gid-only form: one %llu (gid) — the pre-2026-09-09 shape.
-        // nullptr for providers that have no gid-only route (20770407 / SDM answer 404).
+        // needsDepot=true: "%llu depot, %llu gid"；否则只有一个 "%llu gid"。
         const char*      urlTemplate;
-        // Optional depot-aware form: %u depot, %llu gid. Preferred whenever the
-        // caller knows the depot, and required for correctness — see kProviders
-        // below. nullptr for providers that only speak gid.
-        const char*      urlTemplateEx;
         Parser           parse;
+        // 只认 depot+gid 路由的源（20770407 / SDM 走 gid-only 会 404）。
+        // 调用方没有 depotId 时跳过该源且不记失败，见 FetchWithFailover。
+        bool             needsDepot;
+        // 额外请求头（如 manifestdex 要求的 User-Agent），nullptr 表示不加。
+        const wchar_t*   headers;
     };
 
     consteval Provider Make(std::string_view name, const char* url, Parser parse,
