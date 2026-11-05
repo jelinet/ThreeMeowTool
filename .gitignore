@@ -72,3 +72,10 @@ Testing/
 .claude/*
 .claude/
 .DS_Store
+
+# Local helper scripts and drop-in test files
+_*.bat
+_*.ps1
+_*.py
+steam.cfg
+log.txt
