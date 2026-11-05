@@ -5,6 +5,8 @@
 #include "Utils/HookSupport/VehCommon.h"
 #include "Utils/SteamMetadata/SteamDiagnostics.h"
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <windows.h>
 
@@ -17,6 +19,15 @@ namespace {
     
     void* g_pCUser = nullptr;
     PackageInfo* g_pInjectedPackageInfo = nullptr;
+
+    // 家庭共享的出借方 accountid，按 AppId 记录。
+    // Steam 在 bFamilyShared 置位期间把 AppOwnership::SteamId32 填成出借人，
+    // 我这边把标记清掉之后，只有这个字段还能反查归属。上报游玩状态时要用它
+    // 把 owner 还原成真实出借方，否则服务器会认为是一个没有许可的账号在跑
+    // 共享游戏。
+    std::unordered_map<AppId_t, AccountID_t> g_familySharedOwners;
+    std::mutex g_familySharedOwnersMutex;
+
     bool  g_licenseInitialized = false;
     bool  g_licenseRefreshPending = false;
     // 回退自举一次性标志：看门狗线程置位，Steam IPC 线程消费（原子，跨线程）。
@@ -133,6 +144,28 @@ namespace {
             LOG_PACKAGE_DEBUG("CheckAppOwnership: captured CUser {}", g_pCUser);
         }
 
+        // 必须赶在下面清标记之前记下出借方：原始归属只在这两个标记还在时才有意义。
+        // 记录一旦写下就不再抹除，后续每次上报都要靠它还原 owner。
+        // 只认 bFamilyShared / bBorrowed：这两个标记置位就代表当前是借来用的，
+        // 本人拥有的 AppId 不会带着它们。这条分支在游玩期间会被反复触发，
+        // 值没变就不重复落盘。
+        if (pOwn && (pOwn->bFamilyShared || pOwn->bBorrowed) && pOwn->SteamId32 != 0) {
+            // 日志放到锁外：写盘可能阻塞，不该让上报线程陪着等。
+            bool recorded = false;
+            {
+                std::lock_guard<std::mutex> lock(g_familySharedOwnersMutex);
+                AccountID_t& slot = g_familySharedOwners[appId];
+                if (slot != pOwn->SteamId32) {
+                    slot = pOwn->SteamId32;
+                    recorded = true;
+                }
+            }
+            if (recorded) {
+                LOG_PACKAGE_INFO("FamilySharing: recorded lender {} for AppId={} (familyShared={} borrowed={})",
+                                 pOwn->SteamId32, appId, pOwn->bFamilyShared, pOwn->bBorrowed);
+            }
+        }
+
         TryInitFakeLicenseOnce();
 
         // 自举刷新（只一次）：回退场景下这次调用大概率是第一次，
@@ -145,35 +178,18 @@ namespace {
         }
 
         if (LuaConfig::HasDepot(appId,false)) {
-            // 家庭共享借来的游戏不计入真拥有，避免后续被排除在注入之外
-            bool isTrulyOwned = result && (pOwn->ExistInPackageNums > 1) && !pOwn->bFamilyShared && !pOwn->bBorrowed;
-            if (isTrulyOwned) {
+            if (result && pOwn->ExistInPackageNums > 1) {
                 // Actually owned — record so HasDepot excludes it going forward
                 LuaConfig::MarkOwned(appId);
                 pOwn->ReleaseState = EAppReleaseState::Released;
             } else {
                 pOwn->PackageId    = kInjectedPackageId;
                 pOwn->ReleaseState = EAppReleaseState::Released;
-                pOwn->bOwnsLicense = true; // This forces DLCs and enables decoupled family shared games
+                pOwn->bOwnsLicense = true; //This forces DLCs on steam family shared games that u dont own when adding their appid via .lua
                 // Setting this free flag to false will hide it from the library UI.
                 pOwn->bFreeLicense = false;
-                pOwn->bFamilyShared   = false;
-                pOwn->bBorrowed       = false;
-                pOwn->bLicenseLocked  = false;
-                // SteamId32 保持原始值：库详情页按所有者是否为本人判定家庭横幅，清零会误触发
                 return true;
             }
-        }
-
-        // 非 Lua 名单的纯借用游戏同样去锁去标记，压制库锁定与玩法限制
-        if (pOwn && (pOwn->bFamilyShared || pOwn->bBorrowed)) {
-            if (pOwn->bLicenseLocked) {
-                LOG_PACKAGE_DEBUG("CheckAppOwnership: Clearing bLicenseLocked for shared AppId={}", appId);
-                pOwn->bLicenseLocked = false;
-            }
-            pOwn->bBorrowed = false;
-            pOwn->bOwnsLicense = true;
-            result = true;
         }
 
         return result;
@@ -218,6 +234,12 @@ namespace Hooks_Package {
 
     void RequestRequeryOnce() {
         g_forceRequeryOnce.store(true);
+    }
+
+    AccountID_t GetFamilySharedOwner(AppId_t appId) {
+        std::lock_guard<std::mutex> lock(g_familySharedOwnersMutex);
+        auto it = g_familySharedOwners.find(appId);
+        return it == g_familySharedOwners.end() ? 0 : it->second;
     }
 
     void NotifyLicenseChanged() {

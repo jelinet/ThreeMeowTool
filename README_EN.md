@@ -53,8 +53,11 @@
 - Add optional game-process library injection through `[inject]` in `opensteamtool.toml`.
 - Configure `enabled`, `library_x64`, and `library_x86`; the injected library must match the target process architecture.`library_x64` and `library_x86` may be absolute paths, or relative paths resolved from the Steam root directory.
 
-### Family Sharing and Remote Play
-- Bypass Steam Family Sharing restrictions with zero configuration: the lender's library is never locked and borrowed games lose their borrowed/license-locked flags.
+### Family Sharing
+- Family Shared games can be played directly, and they can also be listed in Lua to unlock DLC. Before reporting play state the tool restores the owner to the real lender, so the report matches the sharing relationship Steam has on record.
+- Earlier versions replaced the owner with a placeholder or with yourself. Steam could not match that to a license, treated the session as invalid, showed "logged in elsewhere" and disconnected after a few minutes. This is now fixed.
+- The sharing slot still follows Steam's rules: the game occupies the lender's running slot and can be reclaimed when the lender needs it. The tool does not interfere with that.
+- To play the same title alongside a family member at the same time, both accounts still need to own it. The tool only corrects the reported owner, it does not change the slot rules.
 
 ### Compatible with games protected by Denuvo and SteamStub
 - SteamStub-only games do not require configuring `AppTicket`. OpenSteamTool can reuse Steam's local ConfigStore ticket and forge the requested AppId through a SteamDRMP off-by-four ticket parsing vulnerability, without injecting into the game process.
