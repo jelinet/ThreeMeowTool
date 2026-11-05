@@ -21,7 +21,7 @@ namespace CDKeyReporter {
     // eresult 对应响应 header 的 eresult（1 = 成功，失败用 2），
     // purchase_result_details 对应响应 body（0 = 无错误，14 = 无效码，15 = 已被使用），
     // error_message 对应响应 header 的 error_message（可选）。
-    // 接口成功时返回的 app_info 里的一项，用来补 config/lua 里的 addappid。
+    // 接口成功时返回的 app_info 里的一项，用来补 里的 addappid。
     //   "appid":"4001890",
     //   "app_info":[{"app_id":"4001890","is_app":1,"depot_decryption_key":"ea50…"}, …]
     struct LuaApp {
