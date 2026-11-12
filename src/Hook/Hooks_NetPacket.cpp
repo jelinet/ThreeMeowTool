@@ -1664,14 +1664,9 @@ namespace {
         if (std::strncmp(targetJobName, "Cloud.", 6) == 0) {
             if (std::strcmp(targetJobName, "Cloud.SignalAppExitSyncDone#1") == 0 ||
                 std::strcmp(targetJobName, "Cloud.ClientConflictResolution#1") == 0){
-                    LOG_NETPACKET_DEBUG("Cloud: {} intentionally passed through", targetJobName);
+                    LOG_NETPACKET_DEBUG("Cloud: {} intentionally passed through", targetJobName); 
                     return false;
-                }
-            if (!NetPkt::IsResolved()) {  
-                LOG_NETPACKET_WARN("Cloud: {} passed through — NetPkt layout not resolved",  
-                           targetJobName);  
-                return false;  
-            }     
+                }    
                 
             if (Hooks_NetPacket_Cloud::HandleSend(targetJobName, pBody, cbBody, pHdr, cbHdr))
                 g_SuppressSend = true;
