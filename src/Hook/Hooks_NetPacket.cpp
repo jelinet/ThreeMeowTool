@@ -1285,7 +1285,55 @@ namespace Hooks_NetPacket_Cloud {
     //     return 0;
     // }
     // 替换 ExtractAppId：遍历顶层 varint 字段，返回第一个 IsApp 认可的值  
+// static uint32 ExtractAppId(const char* jobName, const uint8* body, uint32 cbBody) {  
+//     uint32 pos = 0;  
+//     while (pos < cbBody) {  
+//         uint64 tag;  
+//         if (!ReadVarint(body, cbBody, pos, tag)) break;  
+//         const uint32 field    = static_cast<uint32>(tag >> 3);  
+//         const uint32 wireType = static_cast<uint32>(tag & 7);  
+  
+//         if (wireType == 0) {  
+//             uint64 v;  
+//             if (!ReadVarint(body, cbBody, pos, v)) break;  
+//             uint32 candidate = static_cast<uint32>(v);  
+//             if (candidate && CloudRedirectHost::IsApp(candidate)) {  
+//                 LOG_NETPACKET_DEBUG("Cloud: {} appId={} found in field {}",  
+//                                     jobName, candidate, field);  
+//                 return candidate;  
+//             }  
+//             continue;  
+//         }  
+//         // 跳过非 varint 字段（复用 FindVarintField 的 skip 逻辑）  
+//         switch (wireType) {  
+//         case 1: if (pos + 8 > cbBody) return 0; pos += 8; break;  
+//         case 5: if (pos + 4 > cbBody) return 0; pos += 4; break;  
+//         case 2: {  
+//             uint64 len;  
+//             if (!ReadVarint(body, cbBody, pos, len)) return 0;  
+//             if (pos + len > cbBody) return 0;  
+//             pos += static_cast<uint32>(len);  
+//             break;  
+//         }  
+//         default: return 0;  
+//         }  
+//     }  
+//     return 0;  
+// }
+
+static void DumpHex(const char* jobName, const uint8* d, uint32 size) {  
+    std::string hex;  
+    char buf[4];  
+    for (uint32 i = 0; i < size && i < 64; ++i) {  
+        sprintf_s(buf, "%02X ", d[i]);  
+        hex += buf;  
+    }  
+    LOG_NETPACKET_WARN("Cloud: {} body[{}] = {}", jobName, size, hex);  
+}  
+  
 static uint32 ExtractAppId(const char* jobName, const uint8* body, uint32 cbBody) {  
+    DumpHex(jobName, body, cbBody);          // 先看原始字节  
+  
     uint32 pos = 0;  
     while (pos < cbBody) {  
         uint64 tag;  
@@ -1293,25 +1341,36 @@ static uint32 ExtractAppId(const char* jobName, const uint8* body, uint32 cbBody
         const uint32 field    = static_cast<uint32>(tag >> 3);  
         const uint32 wireType = static_cast<uint32>(tag & 7);  
   
-        if (wireType == 0) {  
-            uint64 v;  
-            if (!ReadVarint(body, cbBody, pos, v)) break;  
-            uint32 candidate = static_cast<uint32>(v);  
-            if (candidate && CloudRedirectHost::IsApp(candidate)) {  
-                LOG_NETPACKET_DEBUG("Cloud: {} appId={} found in field {}",  
-                                    jobName, candidate, field);  
-                return candidate;  
-            }  
-            continue;  
-        }  
-        // 跳过非 varint 字段（复用 FindVarintField 的 skip 逻辑）  
         switch (wireType) {  
+        case 0: {  
+            uint64 v;  
+            if (!ReadVarint(body, cbBody, pos, v)) return 0;  
+            // 不过滤，全部打出来  
+            LOG_NETPACKET_WARN("Cloud: {} field {} varint = {} (IsApp={})",  
+                               jobName, field, v,  
+                               CloudRedirectHost::IsApp(static_cast<uint32>(v)));  
+            if (v && CloudRedirectHost::IsApp(static_cast<uint32>(v)))  
+                return static_cast<uint32>(v);  
+            break;  
+        }  
         case 1: if (pos + 8 > cbBody) return 0; pos += 8; break;  
-        case 5: if (pos + 4 > cbBody) return 0; pos += 4; break;  
+        case 5: {  
+            if (pos + 4 > cbBody) return 0;  
+            uint32 v; memcpy(&v, body + pos, 4); pos += 4;  
+            LOG_NETPACKET_WARN("Cloud: {} field {} fixed32 = {} (IsApp={})",  
+                               jobName, field, v, CloudRedirectHost::IsApp(v));  
+            if (v && CloudRedirectHost::IsApp(v)) return v;  
+            break;  
+        }  
         case 2: {  
             uint64 len;  
             if (!ReadVarint(body, cbBody, pos, len)) return 0;  
             if (pos + len > cbBody) return 0;  
+            // 嵌套子消息：递归进去找  
+            LOG_NETPACKET_WARN("Cloud: {} field {} nested ({} bytes), recursing",  
+                               jobName, field, len);  
+            uint32 inner = ExtractAppId(jobName, body + pos, static_cast<uint32>(len));  
+            if (inner) return inner;  
             pos += static_cast<uint32>(len);  
             break;  
         }  
@@ -1320,6 +1379,8 @@ static uint32 ExtractAppId(const char* jobName, const uint8* body, uint32 cbBody
     }  
     return 0;  
 }
+
+
 
     // Returns true when CloudRedirect handled the request — the caller must
     // then suppress the outbound frame.
