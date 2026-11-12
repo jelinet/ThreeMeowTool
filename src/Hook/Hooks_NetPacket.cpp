@@ -1291,15 +1291,26 @@ namespace Hooks_NetPacket_Cloud {
                     const uint8* pBody, uint32 cbBody,
                     const uint8* pHdr, uint32 cbHdr)
     {
-        if (!CloudRedirectHost::IsActive()) return false;
+        if (!CloudRedirectHost::IsActive()) {
+            LOG_NETPACKET_DEBUG("Cloud: {} skipped — CloudRedirect not active", jobName);  
+            return false;
+        };
 
         CMsgProtoBufHeader reqHdr;
-        if (!reqHdr.ParseFromArray(pHdr, cbHdr)) return false;
+        if (!reqHdr.ParseFromArray(pHdr, cbHdr)){
+            LOG_NETPACKET_WARN("Cloud: {} skipped — header parse failed (cbHdr={})",  
+                           jobName, cbHdr); 
+            return false;
+        } 
         if (reqHdr.has_steamid() && reqHdr.steamid())
             g_localSteamId = reqHdr.steamid();
 
         const uint32 appId = ExtractAppId(jobName, pBody, cbBody);
-        if (appId == 0 || !CloudRedirectHost::IsApp(appId)) return false;
+        if (appId == 0 || !CloudRedirectHost::IsApp(appId)){
+            LOG_NETPACKET_WARN("Cloud: {} skipped — appId not found in body (cbBody={})",  
+                           jobName, cbBody); 
+            return false;               
+        } 
 
         const uint32 accountId = static_cast<uint32>(g_localSteamId & 0xFFFFFFFFull);
 
@@ -1310,6 +1321,8 @@ namespace Hooks_NetPacket_Cloud {
                                                pBody, cbBody,
                                                respBuf, static_cast<uint32_t>(sizeof(respBuf)),
                                                &respLen, &eresult)) {
+            LOG_NETPACKET_WARN("Cloud: {} app={} — CR_HandleCloudRpc returned false, passing through",  
+                           jobName, appId);  
             return false;   // not a namespace app / unrecognised — let it pass through
         }
 
@@ -1650,8 +1663,16 @@ namespace {
         // Steam's internal cloud state machine untouched.
         if (std::strncmp(targetJobName, "Cloud.", 6) == 0) {
             if (std::strcmp(targetJobName, "Cloud.SignalAppExitSyncDone#1") == 0 ||
-                std::strcmp(targetJobName, "Cloud.ClientConflictResolution#1") == 0)
-                return false;
+                std::strcmp(targetJobName, "Cloud.ClientConflictResolution#1") == 0){
+                    LOG_NETPACKET_DEBUG("Cloud: {} intentionally passed through", targetJobName);
+                    return false;
+                }
+            if (!NetPkt::IsResolved()) {  
+                LOG_NETPACKET_WARN("Cloud: {} passed through — NetPkt layout not resolved",  
+                           targetJobName);  
+                return false;  
+            }     
+                
             if (Hooks_NetPacket_Cloud::HandleSend(targetJobName, pBody, cbBody, pHdr, cbHdr))
                 g_SuppressSend = true;
             return false;   // never body-replace a cloud frame
