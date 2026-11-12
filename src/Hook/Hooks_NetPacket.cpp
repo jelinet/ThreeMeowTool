@@ -1759,6 +1759,7 @@ namespace {
         // ExitSyncDone/ConflictResolution are notifications that must reach
         // Steam's internal cloud state machine untouched.
         if (std::strncmp(targetJobName, "Cloud.", 6) == 0) {
+            if (CloudRedirectHost::HasVtableHooks()) return false;  // vtable 层已接管 
             if (std::strcmp(targetJobName, "Cloud.SignalAppExitSyncDone#1") == 0 ||
                 std::strcmp(targetJobName, "Cloud.ClientConflictResolution#1") == 0){
                     LOG_NETPACKET_DEBUG("Cloud: {} intentionally passed through", targetJobName); 
