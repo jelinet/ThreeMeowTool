@@ -1275,15 +1275,51 @@ namespace Hooks_NetPacket_Cloud {
     // appid lives in field 1 of every Cloud.* request except
     // ClientCommitFileUpload, where it is field 2 (mirrors CloudRedirect's
     // CloudRpcUtils::ExtractAppId).
-    static uint32 ExtractAppId(const char* jobName, const uint8* body, uint32 cbBody) {
-        uint32 fieldNum = 1;
-        if (std::strcmp(jobName, "Cloud.ClientCommitFileUpload#1") == 0)
-            fieldNum = 2;
-        uint64 v = 0;
-        if (FindVarintField(body, cbBody, fieldNum, v))
-            return static_cast<uint32>(v);
-        return 0;
-    }
+    // static uint32 ExtractAppId(const char* jobName, const uint8* body, uint32 cbBody) {
+    //     uint32 fieldNum = 1;
+    //     if (std::strcmp(jobName, "Cloud.ClientCommitFileUpload#1") == 0)
+    //         fieldNum = 2;
+    //     uint64 v = 0;
+    //     if (FindVarintField(body, cbBody, fieldNum, v))
+    //         return static_cast<uint32>(v);
+    //     return 0;
+    // }
+    // 替换 ExtractAppId：遍历顶层 varint 字段，返回第一个 IsApp 认可的值  
+static uint32 ExtractAppId(const char* jobName, const uint8* body, uint32 cbBody) {  
+    uint32 pos = 0;  
+    while (pos < cbBody) {  
+        uint64 tag;  
+        if (!ReadVarint(body, cbBody, pos, tag)) break;  
+        const uint32 field    = static_cast<uint32>(tag >> 3);  
+        const uint32 wireType = static_cast<uint32>(tag & 7);  
+  
+        if (wireType == 0) {  
+            uint64 v;  
+            if (!ReadVarint(body, cbBody, pos, v)) break;  
+            uint32 candidate = static_cast<uint32>(v);  
+            if (candidate && CloudRedirectHost::IsApp(candidate)) {  
+                LOG_NETPACKET_DEBUG("Cloud: {} appId={} found in field {}",  
+                                    jobName, candidate, field);  
+                return candidate;  
+            }  
+            continue;  
+        }  
+        // 跳过非 varint 字段（复用 FindVarintField 的 skip 逻辑）  
+        switch (wireType) {  
+        case 1: if (pos + 8 > cbBody) return 0; pos += 8; break;  
+        case 5: if (pos + 4 > cbBody) return 0; pos += 4; break;  
+        case 2: {  
+            uint64 len;  
+            if (!ReadVarint(body, cbBody, pos, len)) return 0;  
+            if (pos + len > cbBody) return 0;  
+            pos += static_cast<uint32>(len);  
+            break;  
+        }  
+        default: return 0;  
+        }  
+    }  
+    return 0;  
+}
 
     // Returns true when CloudRedirect handled the request — the caller must
     // then suppress the outbound frame.
