@@ -36,6 +36,7 @@ namespace {
     std::mutex        g_mutex;
     std::atomic<bool> g_active{false};
     OSTPlatform::DynamicLibrary::ModuleHandle g_module = nullptr;
+    std::atomic<bool> g_vtableHooks{false};   // CR_InstallVtableHooks succeeded
 
     CR_InitCloudSave_t     g_initCloudSave     = nullptr;
     CR_HandleCloudRpc_t    g_handleCloudRpc    = nullptr;
@@ -154,12 +155,14 @@ void Initialize(const char* steamInstallPath) {
               static_cast<uint32_t>(appIds.size()));
     LOG_INFO("CloudRedirect: registered {} redirected app(s)", appIds.size());
 
-    // Vtable hooks let CR handle Cloud RPCs synchronously (slot4 semantics).
-    if (g_installVtableHooks) {
-        if (g_installVtableHooks())
-            LOG_INFO("CloudRedirect: vtable hooks installed");
-        else
-            LOG_WARN("CloudRedirect: vtable hook install failed, using packet-layer path");
+    // Vtable hooks let CR handle Cloud RPCs synchronously (slot4 semantics).  
+    if (g_installVtableHooks) {  
+        if (g_installVtableHooks()) {  
+            g_vtableHooks.store(true, std::memory_order_release);  
+            LOG_INFO("CloudRedirect: vtable hooks installed");  
+        } else {  
+            LOG_WARN("CloudRedirect: vtable hook install failed, using packet-layer path");  
+        }  
     }
 }
 
@@ -175,6 +178,10 @@ void SyncAppSet() {
 
 bool IsActive() {
     return g_active.load(std::memory_order_acquire);
+}
+
+bool HasVtableHooks() {  
+    return g_vtableHooks.load(std::memory_order_acquire);  
 }
 
 bool IsApp(uint32_t appId) {

@@ -24,6 +24,11 @@ namespace CloudRedirectHost {
     // True once the DLL is loaded and CR_InitCloudSave succeeded.
     bool IsActive();
 
+    // True when CR_InstallVtableHooks() succeeded — CR answers Cloud RPCs  
+    // synchronously at the vtable layer, so the packet-layer path should  
+    // stand down to avoid double-handling.  
+    bool HasVtableHooks();
+
     // Whether CloudRedirect is currently redirecting saves for this appid.
     bool IsApp(uint32_t appId);
 
